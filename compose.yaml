@@ -3,6 +3,16 @@ services:
     build: .
     restart: unless-stopped
     stop_grace_period: 45s
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "yandex_mail_mcp.healthcheck"]
+      interval: 60s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
     env_file: .env
     environment:
       STATE_DB: /data/mail_state.sqlite3
@@ -15,6 +25,10 @@ services:
     profiles: ["mcp"]
     build: .
     restart: unless-stopped
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
     env_file: .env
     environment:
       MCP_TRANSPORT: streamable-http

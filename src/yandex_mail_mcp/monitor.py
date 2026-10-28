@@ -4,6 +4,7 @@ Start with yandex-mail-monitor. First run sets a baseline without notifying
 about existing mail. Later runs classify newly arriving messages by IMAP UID.
 No mail is moved unless TWO independent environment flags enable it.
 """
+
 from __future__ import annotations
 
 import json
@@ -17,7 +18,6 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
-from imapclient import IMAPClient
 from openai import OpenAI
 
 from .config import Settings, env_bool, env_int
@@ -26,10 +26,12 @@ from .mail import Mailbox
 LOG = logging.getLogger(__name__)
 CATEGORIES = {"IMPORTANT", "PROMOTIONS", "OTHER"}
 DECISION_SCHEMA = {
-    "type": "object", "additionalProperties": False,
+    "type": "object",
+    "additionalProperties": False,
     "properties": {
         "category": {"type": "string", "enum": sorted(CATEGORIES)},
-        "urgent": {"type": "boolean"}, "confidence": {"type": "number"},
+        "urgent": {"type": "boolean"},
+        "confidence": {"type": "number"},
         "reason": {"type": "string"},
     },
     "required": ["category", "urgent", "confidence", "reason"],
@@ -65,7 +67,14 @@ def classify(client: OpenAI, model: str, message: dict) -> dict:
         input=json.dumps(data, ensure_ascii=False),
         max_output_tokens=400,
         store=False,
-        text={"format": {"type": "json_schema", "name": "mail_decision", "strict": True, "schema": DECISION_SCHEMA}},
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "mail_decision",
+                "strict": True,
+                "schema": DECISION_SCHEMA,
+            }
+        },
     )
     if getattr(response, "status", None) == "incomplete":
         raise ValueError("Classifier returned an incomplete response")
@@ -78,7 +87,11 @@ def classify(client: OpenAI, model: str, message: dict) -> dict:
     if type(result.get("urgent")) is not bool:
         raise ValueError("Expected boolean urgent")
     confidence = result.get("confidence")
-    if type(confidence) not in {float, int} or not (0 <= confidence <= 1):
+    if (
+        not isinstance(confidence, (float, int))
+        or isinstance(confidence, bool)
+        or not (0 <= confidence <= 1)
+    ):
         raise ValueError("Expected confidence between 0 and 1")
     reason = result.get("reason")
     if not isinstance(reason, str):
@@ -118,7 +131,9 @@ def open_state(filename: str) -> sqlite3.Connection:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(path)
     except (OSError, sqlite3.OperationalError) as exc:
-        raise RuntimeError(f"Cannot open STATE_DB at {filename!r}; check its path and permissions") from exc
+        raise RuntimeError(
+            f"Cannot open STATE_DB at {filename!r}; check its path and permissions"
+        ) from exc
     try:
         conn.execute(
             """CREATE TABLE IF NOT EXISTS mailbox_progress (
@@ -149,10 +164,17 @@ def open_state(filename: str) -> sqlite3.Connection:
                  PRIMARY KEY (uidvalidity, uid)
                )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS monitor_heartbeat (
+                 id INTEGER PRIMARY KEY CHECK (id = 1), updated_at INTEGER NOT NULL
+               )"""
+        )
         conn.commit()
     except sqlite3.Error as exc:
         conn.close()
-        raise RuntimeError(f"Cannot initialize STATE_DB at {filename!r}; check its path and permissions") from exc
+        raise RuntimeError(
+            f"Cannot initialize STATE_DB at {filename!r}; check its path and permissions"
+        ) from exc
     return conn
 
 
@@ -200,7 +222,15 @@ def poll_once(
                     "INSERT OR REPLACE INTO mailbox_progress (mailbox, uidvalidity, last_uid) VALUES (?, ?, ?)",
                     ("INBOX", validity, max_uid),
                 )
-            LOG.info("Initialized mailbox baseline at UID %d; old messages not processed", max_uid)
+            if row is None:
+                LOG.info(
+                    "Initialized mailbox baseline at UID %d; old messages not processed", max_uid
+                )
+            else:
+                LOG.warning(
+                    "UIDVALIDITY changed; reset mailbox baseline to UID %d and discarded pending messages",
+                    max_uid,
+                )
             return 0
         uids = sorted(uid for uid in imap.search(["UID", f"{row[1] + 1}:*"]) if uid > row[1])
         max_uid = max(uids, default=row[1])
@@ -212,10 +242,15 @@ def poll_once(
                 [(validity, uid) for uid in uids if uid > row[1]],
             )
             if max_uid > row[1]:
-                conn.execute("UPDATE mailbox_progress SET last_uid=? WHERE mailbox=?", (max_uid, "INBOX"))
-            queued = [r[0] for r in conn.execute(
-                "SELECT uid FROM pending_messages WHERE uidvalidity=? ORDER BY uid", (validity,)
-            )]
+                conn.execute(
+                    "UPDATE mailbox_progress SET last_uid=? WHERE mailbox=?", (max_uid, "INBOX")
+                )
+            queued = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT uid FROM pending_messages WHERE uidvalidity=? ORDER BY uid", (validity,)
+                )
+            ]
         pending = queued[:50]
         # Gather messages under a read-only connection.
         messages = Mailbox._fetch(imap, pending, max_body_chars=2500, include_errors=True)
@@ -228,8 +263,13 @@ def poll_once(
         if message is None:
             # Deleted between SEARCH and FETCH: advance to avoid retry loops.
             with conn:
-                conn.execute("DELETE FROM pending_messages WHERE uidvalidity=? AND uid=?", (validity, uid))
-                conn.execute("DELETE FROM processing_failures WHERE uidvalidity=? AND uid=? AND attempts < 3", (validity, uid))
+                conn.execute(
+                    "DELETE FROM pending_messages WHERE uidvalidity=? AND uid=?", (validity, uid)
+                )
+                conn.execute(
+                    "DELETE FROM processing_failures WHERE uidvalidity=? AND uid=? AND attempts < 3",
+                    (validity, uid),
+                )
             continue
         stage = "fetch"
         try:
@@ -246,7 +286,14 @@ def poll_once(
                 decision = classify(ai, model, message)
                 conn.execute(
                     "INSERT INTO decisions (uidvalidity, uid, category, urgent, confidence, reason) VALUES (?, ?, ?, ?, ?, ?)",
-                    (validity, uid, decision["category"], int(decision["urgent"]), decision["confidence"], decision["reason"]),
+                    (
+                        validity,
+                        uid,
+                        decision["category"],
+                        int(decision["urgent"]),
+                        decision["confidence"],
+                        decision["reason"],
+                    ),
                 )
                 conn.commit()
             stage = "notification"
@@ -254,10 +301,16 @@ def poll_once(
                 if token and chat_id:
                     notify_telegram(token, chat_id, message, decision)
                 else:
-                    LOG.warning("Important email detected (UID %d); Telegram is not configured", uid)
+                    LOG.warning(
+                        "Important email detected (UID %d); Telegram is not configured", uid
+                    )
             stage = "move"
-            if (auto_move and mailbox.config.allow_write and decision["category"] == "PROMOTIONS"
-                    and decision["confidence"] >= 0.98):
+            if (
+                auto_move
+                and mailbox.config.allow_write
+                and decision["category"] == "PROMOTIONS"
+                and decision["confidence"] >= 0.98
+            ):
                 mailbox.move_to_promotions(uid, confirm=True)
         except Exception:
             conn.execute(
@@ -266,17 +319,27 @@ def poll_once(
                      attempts=CASE WHEN stage=excluded.stage THEN attempts+1 ELSE 1 END, stage=excluded.stage""",
                 (validity, uid, stage),
             )
-            attempts = conn.execute("SELECT attempts FROM processing_failures WHERE uidvalidity=? AND uid=?", (validity, uid)).fetchone()[0]
+            attempts = conn.execute(
+                "SELECT attempts FROM processing_failures WHERE uidvalidity=? AND uid=?",
+                (validity, uid),
+            ).fetchone()[0]
             conn.commit()
             LOG.warning("UID %d failed at %s (attempt %d of 3)", uid, stage, attempts)
             if attempts >= 3:
                 LOG.error("Skipping UID %d after repeated failures at %s", uid, stage)
                 with conn:
-                    conn.execute("DELETE FROM pending_messages WHERE uidvalidity=? AND uid=?", (validity, uid))
+                    conn.execute(
+                        "DELETE FROM pending_messages WHERE uidvalidity=? AND uid=?",
+                        (validity, uid),
+                    )
             continue
         with conn:
-            conn.execute("DELETE FROM processing_failures WHERE uidvalidity=? AND uid=?", (validity, uid))
-            conn.execute("DELETE FROM pending_messages WHERE uidvalidity=? AND uid=?", (validity, uid))
+            conn.execute(
+                "DELETE FROM processing_failures WHERE uidvalidity=? AND uid=?", (validity, uid)
+            )
+            conn.execute(
+                "DELETE FROM pending_messages WHERE uidvalidity=? AND uid=?", (validity, uid)
+            )
         processed += 1
     return processed
 
@@ -286,6 +349,7 @@ def _stop_handler(stop_event: threading.Event):
         if stop_event.is_set():
             raise KeyboardInterrupt
         stop_event.set()
+
     return stop
 
 
@@ -308,12 +372,19 @@ def main() -> None:
     mailbox = Mailbox(config)
     ai = OpenAI(timeout=30.0, max_retries=0)
     stop_event = threading.Event()
-    previous_handlers = {sig: signal.signal(sig, _stop_handler(stop_event)) for sig in (signal.SIGTERM, signal.SIGINT)}
+    previous_handlers = {
+        sig: signal.signal(sig, _stop_handler(stop_event))
+        for sig in (signal.SIGTERM, signal.SIGINT)
+    }
     LOG.info("Inbox monitoring started; automatic moves: %s", auto_move)
     try:
         while not stop_event.is_set():
             try:
                 n = poll_once(mailbox, state, ai, model, token, chat_id, auto_move, stop_event)
+                with state:
+                    state.execute(
+                        "INSERT OR REPLACE INTO monitor_heartbeat (id, updated_at) VALUES (1, unixepoch())"
+                    )
                 if n:
                     LOG.info("Processed %d new messages", n)
             except Exception:

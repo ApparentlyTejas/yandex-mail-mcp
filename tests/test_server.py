@@ -14,6 +14,7 @@ def run_sync_with_asyncio(monkeypatch):
     # Run synchronous tool bodies inline while testing the SDK error boundary.
     async def run_sync(fn, *args, **kwargs):
         return fn(*args)
+
     monkeypatch.setattr(anyio.to_thread, "run_sync", run_sync)
 
 
@@ -31,6 +32,7 @@ def test_unexpected_keyerror_is_not_converted(monkeypatch):
     class Box:
         def folders(self):
             raise KeyError("internal")
+
     monkeypatch.setattr(server, "_mailbox", lambda: Box())
     with pytest.raises(KeyError):
         server.list_folders()
@@ -40,6 +42,7 @@ def test_imap_error_reaches_client(monkeypatch):
     class Box:
         def folders(self):
             raise imaplib.IMAP4.error("No such mailbox")
+
     monkeypatch.setattr(server, "_mailbox", lambda: Box())
     with pytest.raises(ToolError, match="No such mailbox"):
         asyncio.run(server.mcp.call_tool("list_folders", {}))
@@ -51,6 +54,11 @@ def test_non_loopback_requires_auth_or_explicit_override(monkeypatch):
     monkeypatch.delenv("MCP_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("MCP_ALLOW_UNAUTHENTICATED_REMOTE", raising=False)
     monkeypatch.setattr(server, "load_dotenv", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_settings",
+        lambda: SimpleNamespace(imap_host="imap", imap_port=993, allow_write=False),
+    )
     with pytest.raises(ValueError, match="MCP_AUTH_TOKEN"):
         server.main()
 
@@ -61,45 +69,91 @@ def test_specific_host_is_allowed_by_default(monkeypatch):
     monkeypatch.setenv("MCP_AUTH_TOKEN", "secret")
     monkeypatch.delenv("MCP_ALLOWED_HOSTS", raising=False)
     monkeypatch.setattr(server, "load_dotenv", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_settings",
+        lambda: SimpleNamespace(imap_host="imap", imap_port=993, allow_write=False),
+    )
     captured = {}
+
     def app(**kwargs):
         captured.update(kwargs)
         return object()
+
     monkeypatch.setattr(server.mcp, "streamable_http_app", app)
     monkeypatch.setattr(server.uvicorn, "run", lambda *args, **kwargs: None)
     server.main()
     assert "192.168.1.5:*" in captured["transport_security"].allowed_hosts
 
 
+def test_settings_are_cached_and_write_flag_does_not_change(monkeypatch):
+    monkeypatch.setenv("YANDEX_EMAIL", "test@example.com")
+    monkeypatch.setenv("YANDEX_APP_PASSWORD", "test")
+    monkeypatch.setenv("YANDEX_ALLOW_WRITE", "false")
+    server._settings.cache_clear()
+    try:
+        first = server._mailbox().config
+        monkeypatch.setenv("YANDEX_ALLOW_WRITE", "true")
+        assert server._mailbox().config is first
+        assert not first.allow_write
+    finally:
+        server._settings.cache_clear()
+
+
 def test_bearer_auth_rejects_missing_and_wrong_token():
     calls = []
+
     async def app(scope, receive, send):
         calls.append(scope)
+
     async def run(headers):
         sent = []
-        async def receive(): return {"type": "http.request", "body": b""}
-        async def send(message): sent.append(message)
+
+        async def receive():
+            return {"type": "http.request", "body": b""}
+
+        async def send(message):
+            sent.append(message)
+
         await server.BearerAuth(app, "secret")({"type": "http", "headers": headers}, receive, send)
         return sent
-    for headers in ([], [(b"authorization", b"Bearer wrong")], [(b"authorization", b"Bearer secret"), (b"authorization", b"Bearer secret")]):
+
+    for headers in (
+        [],
+        [(b"authorization", b"Bearer wrong")],
+        [(b"authorization", b"Bearer secret"), (b"authorization", b"Bearer secret")],
+    ):
         assert asyncio.run(run(headers))[0]["status"] == 401
     asyncio.run(run([(b"authorization", b"Bearer secret")]))
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("action, approved, moved", [("decline", False, False), ("cancel", False, False), ("accept", False, False), ("accept", True, True)])
+@pytest.mark.parametrize(
+    "action, approved, moved",
+    [
+        ("decline", False, False),
+        ("cancel", False, False),
+        ("accept", False, False),
+        ("accept", True, True),
+    ],
+)
 def test_move_requires_client_acceptance(monkeypatch, action, approved, moved):
     calls = []
+
     class Box:
         config = SimpleNamespace(allow_write=True)
+
         def headers(self, uid, folder):
             return {"from": "alice", "subject": "example"}
+
         def move_to_promotions(self, uid, confirm):
             calls.append(uid)
             return {"uid": uid}
+
     class Client:
         async def elicit(self, message, schema):
             return SimpleNamespace(action=action, data=SimpleNamespace(approve=approved))
+
     monkeypatch.setattr(server, "_mailbox", lambda: Box())
     if moved:
         assert asyncio.run(server.move_to_promotions(1, Client(), True)) == {"uid": 1}

@@ -1,4 +1,5 @@
 """MCP entry point exposing a small, guarded set of mail tools."""
+
 from __future__ import annotations
 
 import os
@@ -6,7 +7,7 @@ import logging
 import imaplib
 import hmac
 import inspect
-from functools import wraps
+from functools import lru_cache, wraps
 
 from dotenv import load_dotenv
 from mcp.server import MCPServer
@@ -21,7 +22,7 @@ import anyio.to_thread
 from pydantic import BaseModel
 
 from .config import Settings, ConfigurationError, env_bool, env_int
-from .mail import Mailbox, MailError
+from .mail import Mailbox, MailError, MailSummary
 
 mcp = MCPServer(
     "Yandex Mail",
@@ -33,10 +34,13 @@ mcp = MCPServer(
     ),
 )
 
+
 def tool_errors(fn):
     def translate(exc):
         if isinstance(exc, LoginError):
-            return ToolError("IMAP authentication failed; check your credentials and whether IMAP is enabled")
+            return ToolError(
+                "IMAP authentication failed; check your credentials and whether IMAP is enabled"
+            )
         if isinstance(exc, imaplib.IMAP4.abort):
             return ToolError("IMAP connection was interrupted; please retry")
         if isinstance(exc, imaplib.IMAP4.error):
@@ -48,6 +52,7 @@ def tool_errors(fn):
         return None
 
     if inspect.iscoroutinefunction(fn):
+
         @wraps(fn)
         async def async_wrapped(*args, **kwargs):
             try:
@@ -57,6 +62,7 @@ def tool_errors(fn):
                 if error is None:
                     raise
                 raise error from exc
+
         return async_wrapped
 
     @wraps(fn)
@@ -68,11 +74,17 @@ def tool_errors(fn):
             if error is None:
                 raise
             raise error from exc
+
     return wrapped
 
 
+@lru_cache(maxsize=1)
+def _settings() -> Settings:
+    return Settings.from_env()
+
+
 def _mailbox() -> Mailbox:
-    return Mailbox(Settings.from_env())
+    return Mailbox(_settings())
 
 
 class BearerAuth:
@@ -85,7 +97,9 @@ class BearerAuth:
             headers = [value for key, value in scope["headers"] if key.lower() == b"authorization"]
             expected = b"Bearer " + self.token.encode("utf-8")
             if len(headers) != 1 or not hmac.compare_digest(headers[0], expected):
-                await PlainTextResponse("Unauthorized", status_code=401, headers={"WWW-Authenticate": "Bearer"})(scope, receive, send)
+                await PlainTextResponse(
+                    "Unauthorized", status_code=401, headers={"WWW-Authenticate": "Bearer"}
+                )(scope, receive, send)
                 return
         await self.app(scope, receive, send)
 
@@ -99,21 +113,23 @@ def list_folders() -> list[str]:
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
 @tool_errors
-def list_recent_emails(limit: int = 20, unread_only: bool = False, folder: str = "INBOX") -> list[dict]:
+def list_recent_emails(
+    limit: int = 20, unread_only: bool = False, folder: str = "INBOX"
+) -> list[MailSummary]:
     """Read most recent messages, without marking them read. Maximum 100."""
     return _mailbox().recent(limit=limit, unread_only=unread_only, folder=folder)
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
 @tool_errors
-def search_emails(query: str, limit: int = 20, folder: str = "INBOX") -> list[dict]:
+def search_emails(query: str, limit: int = 20, folder: str = "INBOX") -> list[MailSummary]:
     """Find sender, subject or content matches in a folder."""
     return _mailbox().search(query=query, limit=limit, folder=folder)
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
 @tool_errors
-def get_email(uid: int, folder: str = "INBOX") -> dict:
+def get_email(uid: int, folder: str = "INBOX") -> MailSummary:
     """Read a message by IMAP UID, without marking it as read."""
     return _mailbox().message(uid=uid, folder=folder)
 
@@ -122,7 +138,11 @@ class MoveConfirmation(BaseModel):
     approve: bool
 
 
-@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True))
+@mcp.tool(
+    annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True
+    )
+)
 @tool_errors
 async def move_to_promotions(uid: int, ctx: Context, confirm: bool = False) -> dict:
     """Move a message from Inbox to a dedicated promotions folder.
@@ -148,6 +168,13 @@ async def move_to_promotions(uid: int, ctx: Context, confirm: bool = False) -> d
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     load_dotenv()
+    settings = _settings()
+    logging.info(
+        "Mail server configured: host=%s port=%s write=%s",
+        settings.imap_host,
+        settings.imap_port,
+        settings.allow_write,
+    )
     transport = os.getenv("MCP_TRANSPORT", "stdio").strip()
     if transport == "stdio":
         mcp.run()
@@ -157,21 +184,36 @@ def main() -> None:
         token = os.getenv("MCP_AUTH_TOKEN", "")
         if host not in {"127.0.0.1", "localhost", "::1"} and not token:
             if not env_bool("MCP_ALLOW_UNAUTHENTICATED_REMOTE"):
-                raise ConfigurationError("Non-loopback MCP_HOST requires MCP_AUTH_TOKEN or MCP_ALLOW_UNAUTHENTICATED_REMOTE=true")
-            logging.warning("HTTP MCP is accessible without authentication on a non-loopback address")
+                raise ConfigurationError(
+                    "Non-loopback MCP_HOST requires MCP_AUTH_TOKEN or MCP_ALLOW_UNAUTHENTICATED_REMOTE=true"
+                )
+            logging.warning(
+                "HTTP MCP is accessible without authentication on a non-loopback address"
+            )
         default_hosts = "localhost:*,127.0.0.1:*,[::1]:*"
         if host not in {"localhost", "127.0.0.1", "::1", "0.0.0.0", "::"}:
             host_header = f"[{host}]" if ":" in host else host
             default_hosts += f",{host_header}:*"
-        hosts = [x.strip() for x in os.getenv("MCP_ALLOWED_HOSTS", default_hosts).split(",") if x.strip()]
-        origins = [x.strip() for x in os.getenv("MCP_ALLOWED_ORIGINS", "http://localhost:*,http://127.0.0.1:*,http://[::1]:*").split(",") if x.strip()]
-        security = TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=hosts, allowed_origins=origins)
-        app = mcp.streamable_http_app(host=host, transport_security=security)
-        if token:
-            app = BearerAuth(app, token)
+        hosts = [
+            x.strip() for x in os.getenv("MCP_ALLOWED_HOSTS", default_hosts).split(",") if x.strip()
+        ]
+        origins = [
+            x.strip()
+            for x in os.getenv(
+                "MCP_ALLOWED_ORIGINS", "http://localhost:*,http://127.0.0.1:*,http://[::1]:*"
+            ).split(",")
+            if x.strip()
+        ]
+        security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True, allowed_hosts=hosts, allowed_origins=origins
+        )
+        http_app = mcp.streamable_http_app(host=host, transport_security=security)
+        app = BearerAuth(http_app, token) if token else http_app
         logging.info("MCP HTTP listening on %s:%s; authentication=%s", host, port, bool(token))
         uvicorn.run(
-            app, host=host, port=port,
+            app,
+            host=host,
+            port=port,
         )
     else:
         raise ValueError("MCP_TRANSPORT must be 'stdio' or 'streamable-http'")

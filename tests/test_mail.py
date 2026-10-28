@@ -15,7 +15,9 @@ def test_parse_message_decodes_unicode_and_does_not_include_attachment():
     msg["To"] = "me@example.com"
     msg["Subject"] = "Важный документ"
     msg.set_content("Здравствуйте! Оплатите счёт до пятницы.")
-    msg.add_attachment(b"SECRET-ATTACHMENT", maintype="application", subtype="octet-stream", filename="test.bin")
+    msg.add_attachment(
+        b"SECRET-ATTACHMENT", maintype="application", subtype="octet-stream", filename="test.bin"
+    )
     parsed = parse_message(msg.as_bytes(), 123)
     assert parsed["subject"] == "Важный документ"
     assert "Оплатите" in parsed["preview"]
@@ -27,10 +29,37 @@ def test_parse_message_decodes_unicode_and_does_not_include_attachment():
 def test_html_ignores_script_content():
     msg = EmailMessage()
     msg["Subject"] = "HTML"
-    msg.set_content("<html><script>do something bad</script><body>Hello world</body></html>", subtype="html")
+    msg.set_content(
+        "<html><script>do something bad</script><body>Hello world</body></html>", subtype="html"
+    )
     parsed = parse_message(msg.as_bytes(), 1)
     assert "Hello world" in parsed["preview"]
     assert "something bad" not in parsed["preview"]
+
+
+def test_inline_attachment_is_detected_and_excluded_from_preview():
+    msg = EmailMessage()
+    msg.set_content("Actual body")
+    msg.add_attachment(
+        "PRIVATE ATTACHMENT", subtype="plain", filename="document.txt", disposition="inline"
+    )
+    parsed = parse_message(msg.as_bytes(), 1)
+    assert parsed["has_attachments"] is True
+    assert parsed["preview"] == "Actual body"
+
+
+def test_html_blocks_and_entities_are_separated():
+    msg = EmailMessage()
+    msg.set_content(
+        "<table><tr><td>Итого:</td><td>100 &amp; 20</td></tr></table><p>A<br>B</p>", subtype="html"
+    )
+    assert parse_message(msg.as_bytes(), 1)["preview"] == "Итого: 100 & 20 A B"
+
+
+def test_date_uses_iso_format_and_preserves_invalid_input():
+    raw = b"Date: Tue, 28 Oct 2026 10:00:00 +0300\r\n\r\n"
+    assert parse_message(raw, 1)["date"] == "2026-10-28T10:00:00+03:00"
+    assert parse_message(b"Date: nonsense\r\n\r\n", 2)["date"] == "nonsense"
 
 
 def test_invalid_uid_rejected():
@@ -46,17 +75,28 @@ def test_no_mutation_without_explicit_opt_in():
 
 
 def test_no_mutation_without_confirmation():
-    box = Mailbox(Settings(email="test@yandex.com", app_password="not-a-real-password", allow_write=True))
+    box = Mailbox(
+        Settings(email="test@yandex.com", app_password="not-a-real-password", allow_write=True)
+    )
     with pytest.raises(PermissionError, match="confirm"):
         box.move_to_promotions(3)
 
 
 def test_system_folder_flag_is_rejected():
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x", allow_write=True, promotions_folder="Archive"))
+    box = Mailbox(
+        Settings(
+            email="test@yandex.com", app_password="x", allow_write=True, promotions_folder="Archive"
+        )
+    )
+
     class IMAP:
-        def list_folders(self): return [((b"\\Trash",), b"/", "Archive")]
+        def list_folders(self):
+            return [((b"\\Trash",), b"/", "Archive")]
+
     @contextmanager
-    def connect(): yield IMAP()
+    def connect():
+        yield IMAP()
+
     box.connect = connect
     with pytest.raises(ValueError, match="safe"):
         box.move_to_promotions(3, confirm=True)
@@ -64,23 +104,58 @@ def test_system_folder_flag_is_rejected():
 
 @pytest.mark.parametrize("name", ["Черновики", "Удалённые", "Sent", "Spam"])
 def test_system_folder_name_is_rejected(name):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x", allow_write=True, promotions_folder=name))
+    box = Mailbox(
+        Settings(
+            email="test@yandex.com", app_password="x", allow_write=True, promotions_folder=name
+        )
+    )
     with pytest.raises(ValueError, match="safe"):
         box.move_to_promotions(3, confirm=True)
 
 
 def test_preview_fetches_only_bounded_text_section():
     calls = []
+
     class IMAP:
         def fetch(self, uids, fields):
             calls.append(fields)
             if fields == ["BODY.PEEK[HEADER]", "BODYSTRUCTURE"]:
-                structure = ([
-                    (b"TEXT", b"PLAIN", (b"CHARSET", b"UTF-8"), None, None, b"BASE64", 12, 1, None, None),
-                    (b"APPLICATION", b"PDF", (b"NAME", b"large.pdf"), None, None, b"BASE64", 5000000, None, (b"ATTACHMENT", (b"FILENAME", b"large.pdf"))),
-                ], b"MIXED")
-                return {1: {b"BODY[HEADER]": b"Subject: Hello\r\nFrom: a@example.com\r\n\r\n", b"BODYSTRUCTURE": structure}}
+                structure = (
+                    [
+                        (
+                            b"TEXT",
+                            b"PLAIN",
+                            (b"CHARSET", b"UTF-8"),
+                            None,
+                            None,
+                            b"BASE64",
+                            12,
+                            1,
+                            None,
+                            None,
+                        ),
+                        (
+                            b"APPLICATION",
+                            b"PDF",
+                            (b"NAME", b"large.pdf"),
+                            None,
+                            None,
+                            b"BASE64",
+                            5000000,
+                            None,
+                            (b"ATTACHMENT", (b"FILENAME", b"large.pdf")),
+                        ),
+                    ],
+                    b"MIXED",
+                )
+                return {
+                    1: {
+                        b"BODY[HEADER]": b"Subject: Hello\r\nFrom: a@example.com\r\n\r\n",
+                        b"BODYSTRUCTURE": structure,
+                    }
+                }
             return {1: {b"BODY[1]<0>": b"SGVsbG8gd29ybGQ="}}
+
     result = Mailbox._fetch(IMAP(), [1])
     assert result[0]["preview"] == "Hello world"
     assert result[0]["has_attachments"]
@@ -90,13 +165,19 @@ def test_preview_fetches_only_bounded_text_section():
 def test_get_email_rejects_large_message_before_body_fetch():
     box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
     calls = []
+
     class IMAP:
-        def select_folder(self, *args, **kwargs): pass
+        def select_folder(self, *args, **kwargs):
+            pass
+
         def fetch(self, uids, fields):
             calls.append(fields)
             return {1: {b"RFC822.SIZE": 21 * 1024 * 1024}}
+
     @contextmanager
-    def connect(): yield IMAP()
+    def connect():
+        yield IMAP()
+
     box.connect = connect
     with pytest.raises(ValueError, match="20 MiB"):
         box.message(1)
@@ -105,16 +186,24 @@ def test_get_email_rejects_large_message_before_body_fetch():
 
 def test_search_uses_server_results_without_300_message_cap(monkeypatch):
     box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+
     class IMAP:
-        def select_folder(self, *args, **kwargs): pass
+        def select_folder(self, *args, **kwargs):
+            pass
+
         def search(self, criteria, charset=None):
             assert criteria == ["TEXT", "счёт"]
             assert charset == "UTF-8"
             return [1, 500]
+
     @contextmanager
-    def connect(): yield IMAP()
+    def connect():
+        yield IMAP()
+
     box.connect = connect
-    monkeypatch.setattr(Mailbox, "_fetch", staticmethod(lambda imap, uids, **kwargs: [{"uid": uid} for uid in uids]))
+    monkeypatch.setattr(
+        Mailbox, "_fetch", staticmethod(lambda imap, uids, **kwargs: [{"uid": uid} for uid in uids])
+    )
     assert box.search("счёт", limit=1) == [{"uid": 500}]
 
 
@@ -122,7 +211,19 @@ def test_fetch_batches_sections_and_handles_incomplete_base64_and_missing_struct
     data = base64.b64encode("Привет мир!".encode())[:-3]
     assert len(data) % 4 == 1
     calls = []
-    text_part = (b"TEXT", b"PLAIN", (b"CHARSET", b"UTF-8"), None, None, b"BASE64", 40, 1, None, None)
+    text_part = (
+        b"TEXT",
+        b"PLAIN",
+        (b"CHARSET", b"UTF-8"),
+        None,
+        None,
+        b"BASE64",
+        40,
+        1,
+        None,
+        None,
+    )
+
     class IMAP:
         def fetch(self, uids, fields):
             calls.append((uids, fields))
@@ -133,6 +234,7 @@ def test_fetch_batches_sections_and_handles_incomplete_base64_and_missing_struct
                     3: {b"BODY[HEADER]": b"Subject: bad\r\n\r\n"},
                 }
             return {1: {b"BODY[1]<0>": data}, 2: {b"BODY[1]<0>": base64.b64encode(b"second")}}
+
     result = Mailbox._fetch(IMAP(), [1, 2, 3], include_errors=True)
     assert result[0]["preview"].startswith("Привет")
     assert result[1]["preview"] == "second"
@@ -143,11 +245,18 @@ def test_fetch_batches_sections_and_handles_incomplete_base64_and_missing_struct
 
 def test_search_does_not_fallback_on_aborted_connection():
     box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+
     class IMAP:
-        def select_folder(self, *args, **kwargs): pass
-        def search(self, *args, **kwargs): raise imaplib.IMAP4.abort("disconnected")
+        def select_folder(self, *args, **kwargs):
+            pass
+
+        def search(self, *args, **kwargs):
+            raise imaplib.IMAP4.abort("disconnected")
+
     @contextmanager
-    def connect(): yield IMAP()
+    def connect():
+        yield IMAP()
+
     box.connect = connect
     with pytest.raises(imaplib.IMAP4.abort, match="disconnected"):
         box.search("example")
@@ -155,12 +264,18 @@ def test_search_does_not_fallback_on_aborted_connection():
 
 def test_headers_does_not_fetch_full_message():
     box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+
     class IMAP:
-        def select_folder(self, *args, **kwargs): pass
+        def select_folder(self, *args, **kwargs):
+            pass
+
         def fetch(self, uids, fields):
             assert fields == ["BODY.PEEK[HEADER]"]
             return {1: {b"BODY[HEADER]": b"Subject: Large\r\nFrom: a@example.com\r\n\r\n"}}
+
     @contextmanager
-    def connect(): yield IMAP()
+    def connect():
+        yield IMAP()
+
     box.connect = connect
     assert box.headers(1)["subject"] == "Large"

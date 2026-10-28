@@ -1,10 +1,10 @@
 """Configuration loaded from environment variables."""
+
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 
-from dotenv import load_dotenv
 from pydantic import SecretStr
 
 
@@ -40,11 +40,12 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        load_dotenv()
         email = os.getenv("YANDEX_EMAIL", "").strip()
         password = SecretStr(os.getenv("YANDEX_APP_PASSWORD", "").strip())
         if not email or not password.get_secret_value():
-            raise ConfigurationError("Set YANDEX_EMAIL and YANDEX_APP_PASSWORD in the environment (see .env.example)")
+            raise ConfigurationError(
+                "Set YANDEX_EMAIL and YANDEX_APP_PASSWORD in the environment (see .env.example)"
+            )
         return cls(
             email=email,
             app_password=password,
