@@ -80,6 +80,7 @@ def tool_errors(fn):
 
 @lru_cache(maxsize=1)
 def _settings() -> Settings:
+    load_dotenv()
     return Settings.from_env()
 
 
@@ -167,7 +168,6 @@ async def move_to_promotions(uid: int, ctx: Context, confirm: bool = False) -> d
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    load_dotenv()
     settings = _settings()
     logging.info(
         "Mail server configured: host=%s port=%s write=%s",

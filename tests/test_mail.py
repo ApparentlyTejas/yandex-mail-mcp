@@ -48,6 +48,34 @@ def test_inline_attachment_is_detected_and_excluded_from_preview():
     assert parsed["preview"] == "Actual body"
 
 
+def test_forwarded_message_is_not_in_preview():
+    outer = EmailMessage()
+    outer.set_content("Outer body")
+    inner = EmailMessage()
+    inner.set_content("INNER SECRET BODY")
+    outer.add_attachment(inner, filename="forwarded.eml")
+    result = parse_message(outer.as_bytes(), 1)
+    assert result["has_attachments"] is True
+    assert result["preview"] == "Outer body"
+
+
+def test_inline_image_without_filename_counts_as_attachment_in_both_paths():
+    from yandex_mail_mcp.mail import _text_sections
+
+    msg = EmailMessage()
+    msg.set_content("Body")
+    msg.add_attachment(b"png", maintype="image", subtype="png", disposition="inline", cid="<x>")
+    assert parse_message(msg.as_bytes(), 1)["has_attachments"] is True
+    structure = (
+        [
+            (b"TEXT", b"PLAIN", None, None, None, b"7BIT", 10, 1, None, None),
+            (b"IMAGE", b"PNG", None, b"<x>", None, b"BASE64", 4, None, (b"INLINE", None)),
+        ],
+        b"RELATED",
+    )
+    assert _text_sections(structure)[1] is True
+
+
 def test_html_blocks_and_entities_are_separated():
     msg = EmailMessage()
     msg.set_content(
@@ -238,7 +266,7 @@ def test_fetch_batches_sections_and_handles_incomplete_base64_and_missing_struct
     result = Mailbox._fetch(IMAP(), [1, 2, 3], include_errors=True)
     assert result[0]["preview"].startswith("Привет")
     assert result[1]["preview"] == "second"
-    assert result[2] == {"uid": 3, "_fetch_error": True}
+    assert result[2]["uid"] == 3 and result[2]["_fetch_error"] is True
     assert calls[1] == ([1, 2], ["BODY.PEEK[1]<0.16384>"])
     assert [item["uid"] for item in Mailbox._fetch(IMAP(), [1, 2, 3])] == [1, 2]
 

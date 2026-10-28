@@ -15,10 +15,9 @@ import imaplib
 from contextlib import contextmanager
 from email import policy
 from email.parser import BytesParser
-from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
-from typing import Iterator, cast
-from typing_extensions import TypedDict
+from typing import Iterator
+from typing_extensions import NotRequired, TypedDict
 
 from imapclient import IMAPClient
 
@@ -37,6 +36,7 @@ MailSummary = TypedDict(
         "date": str,
         "preview": str,
         "has_attachments": bool,
+        "_fetch_error": NotRequired[bool],
     },
 )
 
@@ -80,29 +80,43 @@ class _TextFromHTML(HTMLParser):
             self.fragments.append(data)
 
 
+def _is_attachment(kind: str, disposition: str, has_filename: bool) -> bool:
+    return disposition == "attachment" or has_filename or kind not in {"text", "multipart"}
+
+
 def parse_message(raw: bytes, uid: int, *, max_body_chars: int = 4000) -> MailSummary:
     msg = BytesParser(policy=policy.default).parsebytes(raw)
     text_parts: list[str] = []
     html_parts: list[str] = []
     has_attachments = False
-    for part in msg.walk():
-        if part.is_multipart():
-            continue
-        if part.get_content_disposition() == "attachment" or part.get_filename() is not None:
+
+    def collect(part):
+        nonlocal has_attachments
+        if _is_attachment(
+            part.get_content_maintype(),
+            part.get_content_disposition() or "",
+            part.get_filename() is not None,
+        ):
             has_attachments = True
-            continue
+            return
+        if part.is_multipart():
+            for child in part.iter_parts():
+                collect(child)
+            return
         if part.get_content_type() not in {"text/plain", "text/html"}:
-            continue
+            return
         try:
             content = part.get_content()
             if not isinstance(content, str):
-                continue
+                return
         except (UnicodeError, LookupError, ValueError, TypeError):
-            continue
+            return
         if part.get_content_type() == "text/plain":
             text_parts.append(content)
         else:
             html_parts.append(content)
+
+    collect(msg)
     if text_parts:
         body = "\n".join(text_parts)
     else:
@@ -110,11 +124,9 @@ def parse_message(raw: bytes, uid: int, *, max_body_chars: int = 4000) -> MailSu
         parser.feed("\n".join(html_parts))
         body = " ".join(parser.fragments)
     body = re.sub(r"\s+", " ", body).strip()
-    date = str(msg.get("Date", ""))
-    try:
-        date = parsedate_to_datetime(date).isoformat()
-    except (ValueError, TypeError, OverflowError):
-        pass
+    date_header = msg.get("Date")
+    parsed_date = getattr(date_header, "datetime", None)
+    date = parsed_date.isoformat() if parsed_date is not None else str(date_header or "")
     return {
         "uid": uid,
         "message_id": str(msg.get("Message-ID", "")),
@@ -148,6 +160,23 @@ def _text_sections(structure):
         if not isinstance(part, (tuple, list)) or not part:
             return
         if isinstance(part[0], list):
+            disposition = part[3] if len(part) > 3 else None
+            name = (
+                string(disposition[0]).lower()
+                if isinstance(disposition, (tuple, list)) and disposition
+                else ""
+            )
+            disp_params = (
+                disposition[1]
+                if isinstance(disposition, (tuple, list)) and len(disposition) > 1
+                else None
+            )
+            has_filename = isinstance(disp_params, (tuple, list)) and any(
+                string(value).lower() == "filename" for value in disp_params[::2]
+            )
+            if _is_attachment("multipart", name, has_filename):
+                has_attachments = True
+                return
             for index, child in enumerate(part[0], 1):
                 walk(child, f"{path}.{index}" if path else str(index))
             return
@@ -171,10 +200,13 @@ def _text_sections(structure):
             if isinstance(disposition, (tuple, list)) and len(disposition) > 1
             else None
         )
-        is_attachment = (
-            disposition_name == "attachment" or bool(params.get("name")) or bool(disposition_params)
-        )
-        if is_attachment or kind not in {"text", "multipart"}:
+        has_filename = bool(params.get("name"))
+        if isinstance(disposition_params, (tuple, list)):
+            has_filename |= any(
+                string(value).lower() == "filename" for value in disposition_params[::2]
+            )
+        is_attachment = _is_attachment(kind, disposition_name, has_filename)
+        if is_attachment:
             has_attachments = True
         if kind == "text" and subtype in {"plain", "html"} and not is_attachment:
             sections.append(
@@ -213,17 +245,27 @@ class Mailbox:
         max_body_chars: int = 4000,
         *,
         include_errors: bool = False,
-    ) -> list[dict]:
+    ) -> list[MailSummary]:
         if not uids:
             return []
         fetched = imap.fetch(uids, ["BODY.PEEK[HEADER]", "BODYSTRUCTURE"])
-        summaries = {}
+        summaries: dict[int, MailSummary] = {}
         sections: dict[str, list[tuple[int, str, str, str]]] = {}
 
         def failure(uid):
             LOG.warning("Incomplete IMAP response for UID %s", uid)
             if include_errors:
-                summaries[uid] = {"uid": uid, "_fetch_error": True}
+                summaries[uid] = {
+                    "uid": uid,
+                    "message_id": "",
+                    "subject": "",
+                    "from": "",
+                    "to": "",
+                    "date": "",
+                    "preview": "",
+                    "has_attachments": False,
+                    "_fetch_error": True,
+                }
             else:
                 summaries.pop(uid, None)
 
@@ -288,7 +330,7 @@ class Mailbox:
         with self.connect() as imap:
             imap.select_folder(folder, readonly=True)
             uids = imap.search(["UNSEEN"] if unread_only else ["ALL"])
-            return cast(list[MailSummary], self._fetch(imap, sorted(uids)[-limit:][::-1]))
+            return self._fetch(imap, sorted(uids)[-limit:][::-1])
 
     def search(self, query: str, limit: int = 20, folder: str = "INBOX") -> list[MailSummary]:
         """Search the server, falling back to the latest 300 previews if unsupported."""
@@ -305,7 +347,7 @@ class Mailbox:
             except imaplib.IMAP4.error:
                 uids = sorted(imap.search(["ALL"]))[-300:][::-1]
             else:
-                return cast(list[MailSummary], self._fetch(imap, uids[:limit], max_body_chars=2000))
+                return self._fetch(imap, uids[:limit], max_body_chars=2000)
             found: list[MailSummary] = []
             for start in range(0, len(uids), 30):
                 for message in self._fetch(imap, uids[start : start + 30], max_body_chars=2000):
@@ -315,7 +357,7 @@ class Mailbox:
                             [message["from"], message["subject"], message["preview"]]
                         ).casefold()
                     ):
-                        found.append(cast(MailSummary, message))
+                        found.append(message)
                         if len(found) >= limit:
                             return found
             return found

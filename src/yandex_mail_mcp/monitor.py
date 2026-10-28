@@ -13,6 +13,7 @@ import os
 import sqlite3
 import signal
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -20,8 +21,8 @@ from urllib.request import Request, urlopen
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from .config import Settings, env_bool, env_int
-from .mail import Mailbox
+from .config import Settings, env_bool, poll_interval, state_db_path
+from .mail import Mailbox, MailSummary
 
 LOG = logging.getLogger(__name__)
 CATEGORIES = {"IMPORTANT", "PROMOTIONS", "OTHER"}
@@ -54,7 +55,7 @@ Do not echo secrets or full email content in reason.
 """
 
 
-def classify(client: OpenAI, model: str, message: dict) -> dict:
+def classify(client: OpenAI, model: str, message: MailSummary) -> dict:
     data = {
         "sender": message["from"][:250],
         "subject": message["subject"][:300],
@@ -104,7 +105,7 @@ def classify(client: OpenAI, model: str, message: dict) -> dict:
     }
 
 
-def notify_telegram(token: str, chat_id: str, message: dict, decision: dict) -> None:
+def notify_telegram(token: str, chat_id: str, message: MailSummary, decision: dict) -> None:
     prefix = "🚨 Срочное письмо" if decision["urgent"] else "📩 Важное письмо"
     text = (
         f"{prefix}\n"
@@ -187,6 +188,14 @@ def save_progress(conn: sqlite3.Connection, mailbox: str, validity: str, uid: in
         (mailbox, validity, uid),
     )
     conn.commit()
+
+
+def save_heartbeat(conn: sqlite3.Connection) -> None:
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO monitor_heartbeat (id, updated_at) VALUES (1, ?)",
+            (int(time.time()),),
+        )
 
 
 def poll_once(
@@ -366,9 +375,9 @@ def main() -> None:
     auto_move = env_bool("AUTO_MOVE_PROMOTIONS")
     if auto_move and not config.allow_write:
         raise RuntimeError("AUTO_MOVE_PROMOTIONS requires YANDEX_ALLOW_WRITE=true")
-    interval = max(60, env_int("POLL_INTERVAL_SECONDS", 180))
+    interval = poll_interval()
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-    state = open_state(os.getenv("STATE_DB", "./data/mail_state.sqlite3"))
+    state = open_state(state_db_path())
     mailbox = Mailbox(config)
     ai = OpenAI(timeout=30.0, max_retries=0)
     stop_event = threading.Event()
@@ -381,10 +390,7 @@ def main() -> None:
         while not stop_event.is_set():
             try:
                 n = poll_once(mailbox, state, ai, model, token, chat_id, auto_move, stop_event)
-                with state:
-                    state.execute(
-                        "INSERT OR REPLACE INTO monitor_heartbeat (id, updated_at) VALUES (1, unixepoch())"
-                    )
+                save_heartbeat(state)
                 if n:
                     LOG.info("Processed %d new messages", n)
             except Exception:

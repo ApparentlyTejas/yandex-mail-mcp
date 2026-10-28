@@ -100,6 +100,26 @@ def test_settings_are_cached_and_write_flag_does_not_change(monkeypatch):
         server._settings.cache_clear()
 
 
+def test_imported_server_loads_dotenv_before_first_tool(monkeypatch):
+    monkeypatch.delenv("YANDEX_EMAIL", raising=False)
+    monkeypatch.delenv("YANDEX_APP_PASSWORD", raising=False)
+    calls = []
+
+    def load():
+        calls.append(1)
+        monkeypatch.setenv("YANDEX_EMAIL", "test@example.com")
+        monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+
+    monkeypatch.setattr(server, "load_dotenv", load)
+    server._settings.cache_clear()
+    try:
+        assert server._mailbox().config.email == "test@example.com"
+        server._mailbox()
+        assert calls == [1]
+    finally:
+        server._settings.cache_clear()
+
+
 def test_bearer_auth_rejects_missing_and_wrong_token():
     calls = []
 
