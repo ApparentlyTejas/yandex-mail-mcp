@@ -19,6 +19,7 @@ class FakeResponses:
         self.value = value
 
     def create(self, **kwargs):
+        self.kwargs = kwargs
         return FakeResponse(self.value)
 
 
@@ -31,12 +32,23 @@ MESSAGE = {"from": "sender@example.com", "subject": "Счёт", "date": "", "pre
 
 
 def test_valid_classification():
+    client = FakeClient({"category": "IMPORTANT", "urgent": True, "confidence": 0.95, "reason": "Платёж"})
     result = classify(
-        FakeClient({"category": "IMPORTANT", "urgent": True, "confidence": 0.95, "reason": "Платёж"}),
+        client,
         "fake", MESSAGE,
     )
     assert result["category"] == "IMPORTANT"
     assert result["urgent"]
+    assert client.responses.kwargs["store"] is False
+    assert client.responses.kwargs["text"]["format"]["strict"] is True
+
+
+def test_incomplete_classification_is_rejected():
+    class Responses:
+        def create(self, **kwargs):
+            return SimpleNamespace(status="incomplete", output_text="{}")
+    with pytest.raises(ValueError, match="incomplete"):
+        classify(SimpleNamespace(responses=Responses()), "fake", MESSAGE)
 
 
 def test_invalid_category_rejected():
@@ -214,4 +226,50 @@ def test_removed_pending_message_clears_retry_record(tmp_path, monkeypatch):
     poll_once(Box(), conn, None, "test")
     assert conn.execute("SELECT count(*) FROM pending_messages").fetchone() == (0,)
     assert conn.execute("SELECT count(*) FROM processing_failures").fetchone() == (0,)
+    conn.close()
+
+
+def test_incremental_search_and_uidnext_baseline(tmp_path, monkeypatch):
+    conn = open_state(str(tmp_path / "state.sqlite"))
+    searches = []
+    class IMAP:
+        def select_folder(self, *args, **kwargs):
+            return {b"UIDVALIDITY": 7, b"UIDNEXT": 101}
+        def search(self, criteria):
+            searches.append(criteria)
+            return [100, 101]
+    class Box:
+        config = SimpleNamespace(allow_write=False)
+        @contextmanager
+        def connect(self):
+            yield IMAP()
+    monkeypatch.setattr(Mailbox, "_fetch", lambda imap, uids, **kwargs: [dict(MESSAGE, uid=uid) for uid in uids])
+    monkeypatch.setattr("yandex_mail_mcp.monitor.classify", lambda *args: {"category": "OTHER", "urgent": False, "confidence": 1, "reason": "ok"})
+    poll_once(Box(), conn, None, "test")
+    assert not searches
+    poll_once(Box(), conn, None, "test")
+    assert searches == [["UID", "101:*"]]
+    assert conn.execute("SELECT uid FROM decisions").fetchall() == [(101,)]
+    conn.close()
+
+
+def test_stop_keeps_queued_messages_for_next_poll(tmp_path, monkeypatch):
+    import threading
+    conn = open_state(str(tmp_path / "state.sqlite"))
+    save_progress(conn, "INBOX", "7", 0)
+    class IMAP:
+        def select_folder(self, *args, **kwargs): return {b"UIDVALIDITY": 7}
+        def search(self, criteria): return [1, 2]
+    class Box:
+        config = SimpleNamespace(allow_write=False)
+        @contextmanager
+        def connect(self): yield IMAP()
+    monkeypatch.setattr(Mailbox, "_fetch", lambda imap, uids, **kwargs: [dict(MESSAGE, uid=uid) for uid in uids])
+    stop = threading.Event()
+    def classify_one(*args):
+        stop.set()
+        return {"category": "OTHER", "urgent": False, "confidence": 1, "reason": "ok"}
+    monkeypatch.setattr("yandex_mail_mcp.monitor.classify", classify_one)
+    poll_once(Box(), conn, None, "test", stop_event=stop)
+    assert conn.execute("SELECT uid FROM pending_messages").fetchall() == [(2,)]
     conn.close()

@@ -4,14 +4,23 @@ from __future__ import annotations
 import os
 import logging
 import imaplib
+import hmac
+import inspect
 from functools import wraps
 
 from dotenv import load_dotenv
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
+from mcp.types import ToolAnnotations
 from mcp.server.mcpserver.exceptions import ToolError
 from imapclient.exceptions import LoginError
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.responses import PlainTextResponse
+import uvicorn
+import anyio.to_thread
+from pydantic import BaseModel
 
-from .config import Settings, ConfigurationError, env_int
+from .config import Settings, ConfigurationError, env_bool, env_int
 from .mail import Mailbox, MailError
 
 mcp = MCPServer(
@@ -25,20 +34,40 @@ mcp = MCPServer(
 )
 
 def tool_errors(fn):
+    def translate(exc):
+        if isinstance(exc, LoginError):
+            return ToolError("IMAP authentication failed; check your credentials and whether IMAP is enabled")
+        if isinstance(exc, imaplib.IMAP4.abort):
+            return ToolError("IMAP connection was interrupted; please retry")
+        if isinstance(exc, imaplib.IMAP4.error):
+            return ToolError(f"IMAP request failed: {exc}")
+        if isinstance(exc, TimeoutError):
+            return ToolError("IMAP connection timed out; please retry")
+        if isinstance(exc, (MailError, ConfigurationError)):
+            return ToolError(str(exc))
+        return None
+
+    if inspect.iscoroutinefunction(fn):
+        @wraps(fn)
+        async def async_wrapped(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as exc:
+                error = translate(exc)
+                if error is None:
+                    raise
+                raise error from exc
+        return async_wrapped
+
     @wraps(fn)
     def wrapped(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
-        except LoginError as exc:
-            raise ToolError("IMAP authentication failed; check your credentials and whether IMAP is enabled") from exc
-        except imaplib.IMAP4.abort as exc:
-            raise ToolError("IMAP connection was interrupted; please retry") from exc
-        except imaplib.IMAP4.error as exc:
-            raise ToolError(f"IMAP request failed: {exc}") from exc
-        except TimeoutError as exc:
-            raise ToolError("IMAP connection timed out; please retry") from exc
-        except (MailError, ConfigurationError) as exc:
-            raise ToolError(str(exc)) from exc
+        except Exception as exc:
+            error = translate(exc)
+            if error is None:
+                raise
+            raise error from exc
     return wrapped
 
 
@@ -46,43 +75,74 @@ def _mailbox() -> Mailbox:
     return Mailbox(Settings.from_env())
 
 
-@mcp.tool()
+class BearerAuth:
+    def __init__(self, app, token):
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = [value for key, value in scope["headers"] if key.lower() == b"authorization"]
+            expected = b"Bearer " + self.token.encode("utf-8")
+            if len(headers) != 1 or not hmac.compare_digest(headers[0], expected):
+                await PlainTextResponse("Unauthorized", status_code=401, headers={"WWW-Authenticate": "Bearer"})(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
 @tool_errors
 def list_folders() -> list[str]:
     """List IMAP folder names in the connected Yandex mailbox."""
     return _mailbox().folders()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
 @tool_errors
 def list_recent_emails(limit: int = 20, unread_only: bool = False, folder: str = "INBOX") -> list[dict]:
     """Read most recent messages, without marking them read. Maximum 100."""
     return _mailbox().recent(limit=limit, unread_only=unread_only, folder=folder)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
 @tool_errors
 def search_emails(query: str, limit: int = 20, folder: str = "INBOX") -> list[dict]:
-    """Find sender, subject or content matches in the last 300 messages in a folder."""
+    """Find sender, subject or content matches in a folder."""
     return _mailbox().search(query=query, limit=limit, folder=folder)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
 @tool_errors
 def get_email(uid: int, folder: str = "INBOX") -> dict:
     """Read a message by IMAP UID, without marking it as read."""
     return _mailbox().message(uid=uid, folder=folder)
 
 
-@mcp.tool()
+class MoveConfirmation(BaseModel):
+    approve: bool
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True))
 @tool_errors
-def move_to_promotions(uid: int, confirm: bool = False) -> dict:
+async def move_to_promotions(uid: int, ctx: Context, confirm: bool = False) -> dict:
     """Move a message from Inbox to a dedicated promotions folder.
 
-    Disabled by default; requires server opt-in and explicit user confirmation.
+    Disabled by default; requires server opt-in, confirm=true and client elicitation.
     Never permanently deletes mail.
     """
-    return _mailbox().move_to_promotions(uid=uid, confirm=confirm)
+    if not confirm:
+        raise ToolError("confirm=true is required before requesting client confirmation")
+    mailbox = _mailbox()
+    if not mailbox.config.allow_write:
+        raise ToolError("Write operations are disabled. Set YANDEX_ALLOW_WRITE=true")
+    message = await anyio.to_thread.run_sync(lambda: mailbox.message(uid, folder="INBOX"))
+    result = await ctx.elicit(
+        f"Move message UID {uid} to promotions? Sender: {message['from'][:180]}\nSubject: {message['subject'][:200]}",
+        schema=MoveConfirmation,
+    )
+    if result.action != "accept" or not result.data.approve:
+        raise ToolError("Move was not approved")
+    return await anyio.to_thread.run_sync(lambda: mailbox.move_to_promotions(uid=uid, confirm=True))
 
 
 def main() -> None:
@@ -92,10 +152,22 @@ def main() -> None:
     if transport == "stdio":
         mcp.run()
     elif transport == "streamable-http":
-        mcp.run(
-            transport="streamable-http",
-            host=os.getenv("MCP_HOST", "127.0.0.1"),
-            port=env_int("MCP_PORT", 8000),
+        host = os.getenv("MCP_HOST", "127.0.0.1").strip()
+        port = env_int("MCP_PORT", 8000)
+        token = os.getenv("MCP_AUTH_TOKEN", "")
+        if host not in {"127.0.0.1", "localhost", "::1"} and not token:
+            if not env_bool("MCP_ALLOW_UNAUTHENTICATED_REMOTE"):
+                raise ConfigurationError("Non-loopback MCP_HOST requires MCP_AUTH_TOKEN or MCP_ALLOW_UNAUTHENTICATED_REMOTE=true")
+            logging.warning("HTTP MCP is accessible without authentication on a non-loopback address")
+        hosts = [x.strip() for x in os.getenv("MCP_ALLOWED_HOSTS", "localhost:*,127.0.0.1:*,[::1]:*").split(",") if x.strip()]
+        origins = [x.strip() for x in os.getenv("MCP_ALLOWED_ORIGINS", "http://localhost:*,http://127.0.0.1:*,http://[::1]:*").split(",") if x.strip()]
+        security = TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=hosts, allowed_origins=origins)
+        app = mcp.streamable_http_app(host=host, transport_security=security)
+        if token:
+            app = BearerAuth(app, token)
+        logging.info("MCP HTTP listening on %s:%s; authentication=%s", host, port, bool(token))
+        uvicorn.run(
+            app, host=host, port=port,
         )
     else:
         raise ValueError("MCP_TRANSPORT must be 'stdio' or 'streamable-http'")

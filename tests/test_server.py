@@ -1,5 +1,6 @@
 import asyncio
 import imaplib
+from types import SimpleNamespace
 import pytest
 import anyio.to_thread
 from mcp.server.mcpserver.exceptions import ToolError
@@ -42,3 +43,58 @@ def test_imap_error_reaches_client(monkeypatch):
     monkeypatch.setattr(server, "_mailbox", lambda: Box())
     with pytest.raises(ToolError, match="No such mailbox"):
         asyncio.run(server.mcp.call_tool("list_folders", {}))
+
+
+def test_non_loopback_requires_auth_or_explicit_override(monkeypatch):
+    monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
+    monkeypatch.setenv("MCP_HOST", "0.0.0.0")
+    monkeypatch.delenv("MCP_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("MCP_ALLOW_UNAUTHENTICATED_REMOTE", raising=False)
+    monkeypatch.setattr(server, "load_dotenv", lambda: None)
+    with pytest.raises(ValueError, match="MCP_AUTH_TOKEN"):
+        server.main()
+
+
+def test_bearer_auth_rejects_missing_and_wrong_token():
+    calls = []
+    async def app(scope, receive, send):
+        calls.append(scope)
+    async def run(headers):
+        sent = []
+        async def receive(): return {"type": "http.request", "body": b""}
+        async def send(message): sent.append(message)
+        await server.BearerAuth(app, "secret")({"type": "http", "headers": headers}, receive, send)
+        return sent
+    for headers in ([], [(b"authorization", b"Bearer wrong")], [(b"authorization", b"Bearer secret"), (b"authorization", b"Bearer secret")]):
+        assert asyncio.run(run(headers))[0]["status"] == 401
+    asyncio.run(run([(b"authorization", b"Bearer secret")]))
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("action, approved, moved", [("decline", False, False), ("cancel", False, False), ("accept", False, False), ("accept", True, True)])
+def test_move_requires_client_acceptance(monkeypatch, action, approved, moved):
+    calls = []
+    class Box:
+        config = SimpleNamespace(allow_write=True)
+        def message(self, uid, folder):
+            return {"from": "alice", "subject": "example"}
+        def move_to_promotions(self, uid, confirm):
+            calls.append(uid)
+            return {"uid": uid}
+    class Client:
+        async def elicit(self, message, schema):
+            return SimpleNamespace(action=action, data=SimpleNamespace(approve=approved))
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    if moved:
+        assert asyncio.run(server.move_to_promotions(1, Client(), True)) == {"uid": 1}
+    else:
+        with pytest.raises(ToolError, match="not approved"):
+            asyncio.run(server.move_to_promotions(1, Client(), True))
+    assert bool(calls) == moved
+
+
+def test_tools_have_mutation_annotations():
+    tools = asyncio.run(server.mcp.list_tools())
+    annotations = {tool.name: tool.annotations for tool in tools}
+    assert annotations["list_folders"].read_only_hint
+    assert not annotations["move_to_promotions"].read_only_hint
