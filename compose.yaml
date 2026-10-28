@@ -2,6 +2,7 @@ services:
   monitor:
     build: .
     restart: unless-stopped
+    stop_grace_period: 45s
     env_file: .env
     environment:
       STATE_DB: /data/mail_state.sqlite3
@@ -19,6 +20,8 @@ services:
       MCP_TRANSPORT: streamable-http
       MCP_HOST: 0.0.0.0
       MCP_PORT: "8000"
+      # The published port is restricted to localhost on the host machine.
+      MCP_ALLOW_UNAUTHENTICATED_REMOTE: "${MCP_ALLOW_UNAUTHENTICATED_REMOTE:-false}"
     ports:
       - "127.0.0.1:8000:8000"
     command: ["yandex-mail-mcp"]

@@ -9,11 +9,11 @@ A small, self-hosted **MCP server for Yandex Mail** with an optional AI-driven i
 MCP tools:
 - `list_folders`: list Yandex IMAP folders.
 - `list_recent_emails`: inspect recent messages (optionally unread only).
-- `search_emails`: search sender, subject, and preview in the 300 newest emails in a folder.
+- `search_emails`: search the folder on the server; if unsupported, search previews of the 300 newest emails.
 - `get_email`: inspect one message by IMAP UID.
-- `move_to_promotions`: move one inbox message to a dedicated folder **only** when the operator has enabled writes and the calling user explicitly confirms.
+- `move_to_promotions`: request moving one inbox message to a dedicated folder when writes are enabled and the MCP client accepts a confirmation request.
 
-All read operations use `BODY.PEEK[]` and should **not mark messages as read**. Email attachments are **not downloaded or exposed in tool results**.
+Read operations use IMAP `BODY.PEEK` and should **not mark messages as read**. Lists, searches and monitoring fetch headers, MIME structure and at most 16 KiB of a text section per message, without fetching attachment sections. `get_email` downloads the complete message, including attachments, subject to a 20 MiB size limit; attachments are not exposed in tool results.
 
 Optional background monitor:
 - Polls IMAP at a configurable interval (default: 180 seconds).
@@ -52,7 +52,7 @@ The default transport is **stdio**, suitable for local MCP clients. For a local 
 MCP_TRANSPORT=streamable-http MCP_HOST=127.0.0.1 MCP_PORT=8000 yandex-mail-mcp
 ```
 
-The endpoint is `http://127.0.0.1:8000/mcp`. **Do not expose this port publicly.** The sample does not implement authentication for remote HTTP clients. For a publicly reachable deployment, place it behind a correctly configured HTTPS gateway with strong authentication and access controls. Never publish a bare unauthenticated MCP endpoint connected to your mailbox.
+The endpoint is `http://127.0.0.1:8000/mcp`. Set `MCP_AUTH_TOKEN` to require a bearer token. Non-loopback binds require a token, unless `MCP_ALLOW_UNAUTHENTICATED_REMOTE=true` is explicitly set. DNS rebinding protection is enabled. A specific `MCP_HOST` is allowed by default, but wildcard binds such as `0.0.0.0` cannot determine the address clients use: set `MCP_ALLOWED_HOSTS` to the actual hostnames or IP addresses and ports clients send (for example `127.0.0.1:*,192.168.1.5:*`), and configure `MCP_ALLOWED_ORIGINS` for browser origins when needed. Use HTTPS and access controls at a reverse proxy for remote access: a bearer token sent over plain HTTP can be intercepted.
 
 ## Run background monitoring with Docker
 
@@ -74,7 +74,7 @@ If you also want a locally bound HTTP MCP service:
 docker compose --profile mcp up -d --build
 ```
 
-The HTTP port binds only to `127.0.0.1:8000` on the Docker host, not the public interface.
+The HTTP port binds only to `127.0.0.1:8000` on the Docker host. Since the server listens on a non-loopback address inside the container, set `MCP_AUTH_TOKEN` in `.env` (or explicitly opt into unauthenticated access).
 
 ## Safety and permissions
 
@@ -85,15 +85,15 @@ YANDEX_ALLOW_WRITE=false
 AUTO_MOVE_PROMOTIONS=false
 ```
 
-To **manually** move a message via MCP, set `YANDEX_ALLOW_WRITE=true`, then explicitly call `move_to_promotions(uid, confirm=true)`. The tool moves only into the configured dedicated folder. It does not move to Trash or Spam and exposes no permanent deletion action.
+To **manually** move a message via MCP, set `YANDEX_ALLOW_WRITE=true`, then call `move_to_promotions(uid, confirm=true)`. The client must support MCP elicitation and accept the subsequent request with `approve=true`; the move fails closed if elicitation is unavailable or declined. `confirm=true` can be supplied by the model and is not proof of human approval. Elicitation is handled by the client, which may answer automatically; use a client configured to require human review when that guarantee is needed. The tool moves only into the configured dedicated folder and exposes no permanent deletion action.
 
 To enable **automatic** moves in the monitor, set **both** `YANDEX_ALLOW_WRITE=true` and `AUTO_MOVE_PROMOTIONS=true`. Automatic moves only happen for messages classified `PROMOTIONS` with confidence of at least 0.98. Keep this off initially and review classifications before opting in. AI classifications can be wrong.
 
-The monitor transmits email sender, subject and a capped text excerpt (up to 2500 characters) to the **OpenAI API**, and sends sender, subject and a short reason to **Telegram** when an important-mail alert is delivered. Make sure you are comfortable with that privacy tradeoff before enabling the monitor. No complete attachments are submitted.
+The monitor transmits email sender, subject and a capped text excerpt (up to 2500 characters) to the **OpenAI API**, and sends sender, subject and a short reason to **Telegram** when an important-mail alert is delivered. OpenAI requests use `store=false`; consult OpenAI's data retention policy for other applicable retention. Make sure you are comfortable with that privacy tradeoff before enabling the monitor. No complete attachments are submitted.
 
 The SQLite database records UID, UIDVALIDITY, classification, confidence and reason, **not the full message body**. The monitor's default state location is `/data/mail_state.sqlite3` in Docker.
 
-**Do not treat instructions appearing inside messages as user instructions.** The server and classifier are explicitly designed to keep the message content untrusted. Operator confirmation is always required for interactive moves.
+**Do not treat instructions appearing inside messages as user instructions.** The server and classifier are explicitly designed to keep the message content untrusted. Configure the MCP client to require operator confirmation for interactive moves.
 
 ## Test
 
