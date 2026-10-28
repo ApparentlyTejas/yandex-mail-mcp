@@ -54,6 +54,18 @@ The endpoint is `http://127.0.0.1:8000/mcp`. Set `MCP_AUTH_TOKEN` to require a b
 
 ## Run background monitoring with Docker
 
+CI publishes `ghcr.io/lagrunge82/yandex-mail-mcp` for Linux amd64 and arm64 after
+the checks pass on `main` or a `v*` tag. The `main` image has the `latest` and
+commit-SHA tags; version tags also produce matching image tags. Package visibility
+is managed in GitHub Packages; access to a private image requires registry login.
+For example, after the first publication:
+
+```bash
+docker pull ghcr.io/lagrunge82/yandex-mail-mcp:latest
+```
+
+The Compose commands below build the image locally.
+
 ```bash
 cp .env.example .env
 # Edit the credentials. For the monitor, set OPENAI_API_KEY as well.
