@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
@@ -15,7 +15,7 @@ def env_bool(name: str, default: bool = False) -> bool:
 @dataclass(frozen=True)
 class Settings:
     email: str
-    app_password: str
+    app_password: str = field(repr=False)
     imap_host: str = "imap.yandex.com"
     imap_port: int = 993
     allow_write: bool = False
