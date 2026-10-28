@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "yandex-mail-mcp"
+version = "0.1.0"
+description = "Safe MCP tools and optional AI inbox monitoring for Yandex Mail"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+  "mcp>=2.0,<3.0",
+  "IMAPClient>=3.0,<4.0",
+  "python-dotenv>=1.0,<2.0",
+]
+
+[project.optional-dependencies]
+monitor = ["openai>=2.0,<3.0"]
+dev = ["pytest>=8.0,<10.0"]
+
+[project.scripts]
+yandex-mail-mcp = "yandex_mail_mcp.server:main"
+yandex-mail-monitor = "yandex_mail_mcp.monitor:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yandex_mail_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
