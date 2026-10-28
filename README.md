@@ -35,21 +35,19 @@ Yandex's IMAP settings: `imap.yandex.com:993` (SSL). The server does not use SMT
 
 ## Run the MCP server locally
 
-Requires Python 3.11 or newer.
+Requires Python 3.11 or newer and [uv](https://docs.astral.sh/uv/getting-started/installation/) for the locked development setup.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+uv sync --locked
 cp .env.example .env
 # Edit .env with your actual credentials
-yandex-mail-mcp
+uv run yandex-mail-mcp
 ```
 
 The default transport is **stdio**, suitable for local MCP clients. For a local HTTP MCP endpoint:
 
 ```bash
-MCP_TRANSPORT=streamable-http MCP_HOST=127.0.0.1 MCP_PORT=8000 yandex-mail-mcp
+MCP_TRANSPORT=streamable-http MCP_HOST=127.0.0.1 MCP_PORT=8000 uv run yandex-mail-mcp
 ```
 
 The endpoint is `http://127.0.0.1:8000/mcp`. Set `MCP_AUTH_TOKEN` to require a bearer token. Non-loopback binds require a token, unless `MCP_ALLOW_UNAUTHENTICATED_REMOTE=true` is explicitly set. DNS rebinding protection is enabled. A specific `MCP_HOST` is allowed by default, but wildcard binds such as `0.0.0.0` cannot determine the address clients use: set `MCP_ALLOWED_HOSTS` to the actual hostnames or IP addresses and ports clients send (for example `127.0.0.1:*,192.168.1.5:*`), and configure `MCP_ALLOWED_ORIGINS` for browser origins when needed. Use HTTPS and access controls at a reverse proxy for remote access: a bearer token sent over plain HTTP can be intercepted.
@@ -65,6 +63,8 @@ docker compose logs -f monitor
 ```
 
 First successful IMAP poll **sets a baseline** at the highest existing UID. Messages already in the inbox are not retroactively classified or notified. Newly delivered messages are processed afterward.
+
+If the mailbox UIDVALIDITY changes, the monitor logs a warning, discards its pending queue and sets a new baseline. Messages already present at that moment are not classified, including pending or newly arrived messages; inspect the inbox manually after such a reset.
 
 The monitor persists SQLite state in a Docker volume. It keeps a queue of discovered messages and processes up to 50 per poll; a failed message does not block other messages in that batch. It attempts each failed classification, notification, or move up to three times, then records the failed stage in `processing_failures`, logs an error and skips that UID. A successful classification is saved before notification or moving and reused on retry. Check the logs and database for skipped messages. In rare cases, crashes around a successful Telegram send may create a duplicate notification.
 
@@ -85,6 +85,8 @@ YANDEX_ALLOW_WRITE=false
 AUTO_MOVE_PROMOTIONS=false
 ```
 
+The `folder` parameter on read tools can access any folder available to the account, including Sent and Drafts. Read-only mode restricts mutations; it does not restrict which folders can be read.
+
 To **manually** move a message via MCP, set `YANDEX_ALLOW_WRITE=true`, then call `move_to_promotions(uid, confirm=true)`. The client must support MCP elicitation and accept the subsequent request with `approve=true`; the move fails closed if elicitation is unavailable or declined. `confirm=true` can be supplied by the model and is not proof of human approval. Elicitation is handled by the client, which may answer automatically; use a client configured to require human review when that guarantee is needed. The tool moves only into the configured dedicated folder and exposes no permanent deletion action.
 
 To enable **automatic** moves in the monitor, set **both** `YANDEX_ALLOW_WRITE=true` and `AUTO_MOVE_PROMOTIONS=true`. Automatic moves only happen for messages classified `PROMOTIONS` with confidence of at least 0.98. Keep this off initially and review classifications before opting in. AI classifications can be wrong.
@@ -98,19 +100,17 @@ The SQLite database records UID, UIDVALIDITY, classification, confidence and rea
 ## Test
 
 ```bash
-pip install -e ".[dev,monitor]"
-pytest -q
+uv sync --locked --all-extras
+uv run --locked pytest -q
 ```
+
+For a standard pip installation, use `pip install -e .` (or `pip install -e ".[monitor]"` for the monitor). Pip resolves dependency versions independently of `uv.lock`.
 
 Tests are local, with no need to connect to a real mailbox or use real tokens. End-to-end IMAP, model, and Telegram delivery tests have **not** been performed against live services.
 
 ## Roadmap
 
-- OAuth-based IMAP login and token refresh.
-- More complete server-side search and batched metadata fetching.
-- Manage reviewed newsletters and opt-out/unsubscribe workflows.
-- Add alert summaries and a tool for reading stored classification decisions.
-- Secure externally hosted MCP transport with authentication, reverse proxy and audit logging.
+See the [project milestones](https://github.com/Lagrunge82/yandex-mail-mcp/milestones) for planned work.
 
 ## Documentation
 

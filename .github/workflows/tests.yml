@@ -15,10 +15,32 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
+      - uses: astral-sh/setup-uv@v6
       - name: Install
-        run: pip install -e ".[dev,monitor]"
+        run: uv sync --locked --all-extras --python ${{ matrix.python-version }}
       - name: Run tests
-        run: pytest -q
-      - name: Check Python syntax
-        run: python -m compileall -q src tests
+        run: uv run --locked --no-sync --python ${{ matrix.python-version }} pytest -q --cov=yandex_mail_mcp --cov-fail-under=75
+
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --all-extras --python 3.13
+      - run: uv run --locked --no-sync ruff check .
+      - run: uv run --locked --no-sync ruff format --check .
+      - run: uv run --locked --no-sync mypy src
+      - name: Audit locked runtime dependencies
+        run: |
+          uv export --locked --all-extras --no-dev --no-emit-project --no-hashes --quiet > /tmp/runtime-requirements.txt
+          uv run --locked --no-sync pip-audit --disable-pip --no-deps -r /tmp/runtime-requirements.txt
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t yandex-mail-mcp:test .
