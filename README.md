@@ -66,7 +66,7 @@ docker compose logs -f monitor
 
 First successful IMAP poll **sets a baseline** at the highest existing UID. Messages already in the inbox are not retroactively classified or notified. Newly delivered messages are processed afterward.
 
-The monitor persists SQLite state in a Docker volume and retries failed classifications and notification deliveries. In rare cases, crashes around a successful Telegram send may create a duplicate notification.
+The monitor persists SQLite state in a Docker volume. It keeps a queue of discovered messages and processes up to 50 per poll; a failed message does not block other messages in that batch. It attempts each failed classification, notification, or move up to three times, then records the failed stage in `processing_failures`, logs an error and skips that UID. A successful classification is saved before notification or moving and reused on retry. Check the logs and database for skipped messages. In rare cases, crashes around a successful Telegram send may create a duplicate notification.
 
 If you also want a locally bound HTTP MCP service:
 

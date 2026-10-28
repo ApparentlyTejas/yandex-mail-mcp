@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from imapclient import IMAPClient
 from openai import OpenAI
 
-from .config import Settings, env_bool
+from .config import Settings, env_bool, env_int
 from .mail import Mailbox
 
 LOG = logging.getLogger(__name__)
@@ -100,24 +100,45 @@ def notify_telegram(token: str, chat_id: str, message: dict, decision: dict) -> 
 
 def open_state(filename: str) -> sqlite3.Connection:
     path = Path(filename)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS mailbox_progress (
-             mailbox TEXT PRIMARY KEY, uidvalidity TEXT NOT NULL,
-             last_uid INTEGER NOT NULL
-           )"""
-    )
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS decisions (
-             uidvalidity TEXT NOT NULL, uid INTEGER NOT NULL,
-             category TEXT NOT NULL, urgent INTEGER NOT NULL,
-             confidence REAL NOT NULL, reason TEXT NOT NULL,
-             processed_at TEXT DEFAULT CURRENT_TIMESTAMP,
-             PRIMARY KEY (uidvalidity, uid)
-           )"""
-    )
-    conn.commit()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path)
+    except (OSError, sqlite3.OperationalError) as exc:
+        raise RuntimeError(f"Cannot open STATE_DB at {filename!r}; check its path and permissions") from exc
+    try:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS mailbox_progress (
+                 mailbox TEXT PRIMARY KEY, uidvalidity TEXT NOT NULL,
+                 last_uid INTEGER NOT NULL
+               )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS decisions (
+                 uidvalidity TEXT NOT NULL, uid INTEGER NOT NULL,
+                 category TEXT NOT NULL, urgent INTEGER NOT NULL,
+                 confidence REAL NOT NULL, reason TEXT NOT NULL,
+                 processed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                 PRIMARY KEY (uidvalidity, uid)
+               )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS processing_failures (
+                 uidvalidity TEXT NOT NULL, uid INTEGER NOT NULL,
+                 attempts INTEGER NOT NULL, stage TEXT NOT NULL,
+                 PRIMARY KEY (uidvalidity, uid)
+               )"""
+        )
+        conn.commit()
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS pending_messages (
+                 uidvalidity TEXT NOT NULL, uid INTEGER NOT NULL,
+                 PRIMARY KEY (uidvalidity, uid)
+               )"""
+        )
+        conn.commit()
+    except sqlite3.Error as exc:
+        conn.close()
+        raise RuntimeError(f"Cannot initialize STATE_DB at {filename!r}; check its path and permissions") from exc
     return conn
 
 
@@ -153,10 +174,31 @@ def poll_once(
             ("INBOX",),
         ).fetchone()
         if row is None or row[0] != validity:
-            save_progress(conn, "INBOX", validity, max_uid)
+            with conn:
+                conn.execute("DELETE FROM pending_messages")
+                conn.execute("DELETE FROM processing_failures WHERE attempts < 3")
+                conn.execute(
+                    "INSERT OR REPLACE INTO mailbox_progress (mailbox, uidvalidity, last_uid) VALUES (?, ?, ?)",
+                    ("INBOX", validity, max_uid),
+                )
             LOG.info("Initialized mailbox baseline at UID %d; old messages not processed", max_uid)
             return 0
-        pending = [uid for uid in uids if uid > row[1]][:50]
+        # Persist discovery and the high-water mark atomically. Pending UIDs remain
+        # independently retryable even after later messages have been processed.
+        with conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO pending_messages (uidvalidity, uid) VALUES (?, ?)",
+                [(validity, uid) for uid in uids if uid > row[1]],
+            )
+            if max_uid > row[1]:
+                conn.execute("UPDATE mailbox_progress SET last_uid=? WHERE mailbox=?", (max_uid, "INBOX"))
+            queued = [r[0] for r in conn.execute(
+                "SELECT uid FROM pending_messages WHERE uidvalidity=? ORDER BY uid", (validity,)
+            )]
+            missing = set(queued) - set(uids)
+            conn.executemany("DELETE FROM pending_messages WHERE uidvalidity=? AND uid=?", [(validity, uid) for uid in missing])
+            conn.executemany("DELETE FROM processing_failures WHERE uidvalidity=? AND uid=? AND attempts < 3", [(validity, uid) for uid in missing])
+        pending = [uid for uid in queued if uid not in missing][:50]
         # Gather messages under a read-only connection.
         messages = Mailbox._fetch(imap, pending, max_body_chars=2500)
     fetched = {message["uid"]: message for message in messages}
@@ -165,33 +207,53 @@ def poll_once(
         message = fetched.get(uid)
         if message is None:
             # Deleted between SEARCH and FETCH: advance to avoid retry loops.
-            save_progress(conn, "INBOX", validity, uid)
+            with conn:
+                conn.execute("DELETE FROM pending_messages WHERE uidvalidity=? AND uid=?", (validity, uid))
+                conn.execute("DELETE FROM processing_failures WHERE uidvalidity=? AND uid=? AND attempts < 3", (validity, uid))
             continue
-        decision = classify(ai, model, message)
-        if decision["category"] == "IMPORTANT":
-            if token and chat_id:
-                notify_telegram(token, chat_id, message, decision)
+        stage = "classification"
+        try:
+            stored = conn.execute(
+                "SELECT category, urgent, confidence, reason FROM decisions WHERE uidvalidity=? AND uid=?",
+                (validity, uid),
+            ).fetchone()
+            if stored:
+                decision = dict(zip(("category", "urgent", "confidence", "reason"), stored))
             else:
-                LOG.warning("Important email detected (UID %d); Telegram is not configured", uid)
-        if (
-            auto_move and mailbox.config.allow_write
-            and decision["category"] == "PROMOTIONS"
-            and decision["confidence"] >= 0.98
-        ):
-            mailbox.move_to_promotions(uid, confirm=True)
-        conn.execute(
-            """INSERT OR REPLACE INTO decisions
-               (uidvalidity, uid, category, urgent, confidence, reason)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                validity, uid, decision["category"],
-                int(decision["urgent"]), decision["confidence"], decision["reason"],
-            ),
-        )
-        # Persist progress after successful classification and actions.
-        # An interrupted send can produce a duplicate Telegram alert on retry.
-        conn.commit()
-        save_progress(conn, "INBOX", validity, uid)
+                decision = classify(ai, model, message)
+                conn.execute(
+                    "INSERT INTO decisions (uidvalidity, uid, category, urgent, confidence, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                    (validity, uid, decision["category"], int(decision["urgent"]), decision["confidence"], decision["reason"]),
+                )
+                conn.commit()
+            stage = "notification"
+            if decision["category"] == "IMPORTANT":
+                if token and chat_id:
+                    notify_telegram(token, chat_id, message, decision)
+                else:
+                    LOG.warning("Important email detected (UID %d); Telegram is not configured", uid)
+            stage = "move"
+            if (auto_move and mailbox.config.allow_write and decision["category"] == "PROMOTIONS"
+                    and decision["confidence"] >= 0.98):
+                mailbox.move_to_promotions(uid, confirm=True)
+        except Exception:
+            conn.execute(
+                """INSERT INTO processing_failures (uidvalidity, uid, attempts, stage) VALUES (?, ?, 1, ?)
+                   ON CONFLICT(uidvalidity, uid) DO UPDATE SET
+                     attempts=CASE WHEN stage=excluded.stage THEN attempts+1 ELSE 1 END, stage=excluded.stage""",
+                (validity, uid, stage),
+            )
+            attempts = conn.execute("SELECT attempts FROM processing_failures WHERE uidvalidity=? AND uid=?", (validity, uid)).fetchone()[0]
+            conn.commit()
+            LOG.warning("UID %d failed at %s (attempt %d of 3)", uid, stage, attempts)
+            if attempts >= 3:
+                LOG.error("Skipping UID %d after repeated failures at %s", uid, stage)
+                with conn:
+                    conn.execute("DELETE FROM pending_messages WHERE uidvalidity=? AND uid=?", (validity, uid))
+            continue
+        with conn:
+            conn.execute("DELETE FROM processing_failures WHERE uidvalidity=? AND uid=?", (validity, uid))
+            conn.execute("DELETE FROM pending_messages WHERE uidvalidity=? AND uid=?", (validity, uid))
         processed += 1
     return processed
 
@@ -209,7 +271,7 @@ def main() -> None:
     auto_move = env_bool("AUTO_MOVE_PROMOTIONS")
     if auto_move and not config.allow_write:
         raise RuntimeError("AUTO_MOVE_PROMOTIONS requires YANDEX_ALLOW_WRITE=true")
-    interval = max(60, int(os.getenv("POLL_INTERVAL_SECONDS", "180")))
+    interval = max(60, env_int("POLL_INTERVAL_SECONDS", 180))
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     state = open_state(os.getenv("STATE_DB", "./data/mail_state.sqlite3"))
     mailbox = Mailbox(config)

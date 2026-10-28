@@ -18,6 +18,22 @@ from imapclient import IMAPClient
 from .config import Settings
 
 
+class MailError(Exception):
+    """An expected error that can be reported to a tool caller."""
+
+
+class MailValueError(MailError, ValueError):
+    pass
+
+
+class MailLookupError(MailError, LookupError):
+    pass
+
+
+class MailPermissionError(MailError, PermissionError):
+    pass
+
+
 class _TextFromHTML(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -86,7 +102,7 @@ def parse_message(raw: bytes, uid: int, *, max_body_chars: int = 4000) -> dict:
 
 def valid_uid(uid: int) -> int:
     if not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0:
-        raise ValueError("uid must be a positive integer")
+        raise MailValueError("uid must be a positive integer")
     return uid
 
 
@@ -133,7 +149,7 @@ class Mailbox:
     def search(self, query: str, limit: int = 20, folder: str = "INBOX") -> list[dict]:
         """Case-insensitive search of sender, subject and preview in the 300 most recent emails."""
         if not query.strip():
-            raise ValueError("query cannot be empty")
+            raise MailValueError("query cannot be empty")
         limit = max(1, min(limit, 100))
         needle = query.casefold()
         with self.connect() as imap:
@@ -156,24 +172,24 @@ class Mailbox:
             imap.select_folder(folder, readonly=True)
             items = self._fetch(imap, [uid], max_body_chars=10000)
             if not items:
-                raise LookupError(f"Message UID {uid} not found in {folder}")
+                raise MailLookupError(f"Message UID {uid} not found in {folder}")
             return items[0]
 
     def move_to_promotions(self, uid: int, confirm: bool = False) -> dict:
         valid_uid(uid)
         if not self.config.allow_write:
-            raise PermissionError("Write operations are disabled. Set YANDEX_ALLOW_WRITE=true")
+            raise MailPermissionError("Write operations are disabled. Set YANDEX_ALLOW_WRITE=true")
         if confirm is not True:
-            raise PermissionError("Explicit confirm=true is required to move a message")
+            raise MailPermissionError("Explicit confirm=true is required to move a message")
         folder = self.config.promotions_folder
         if not folder or folder.upper() in {"INBOX", "TRASH", "SPAM", "DELETED", "JUNK"}:
-            raise ValueError("Choose a safe dedicated promotions folder")
+            raise MailValueError("Choose a safe dedicated promotions folder")
         with self.connect() as imap:
             existing = {name for _, _, name in imap.list_folders()}
             if folder not in existing:
                 imap.create_folder(folder)
             imap.select_folder("INBOX", readonly=False)
             if uid not in imap.search(["UID", str(uid)]):
-                raise LookupError(f"Message UID {uid} not found in INBOX")
+                raise MailLookupError(f"Message UID {uid} not found in INBOX")
             imap.move([uid], folder)
         return {"uid": uid, "moved_to": folder, "deleted_permanently": False}
