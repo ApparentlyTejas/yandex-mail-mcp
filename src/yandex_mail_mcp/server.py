@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import logging
+import imaplib
 from functools import wraps
 
 from dotenv import load_dotenv
@@ -10,9 +11,8 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from imapclient.exceptions import LoginError
 
-from .config import Settings
-from .config import env_int
-from .mail import Mailbox
+from .config import Settings, ConfigurationError, env_int
+from .mail import Mailbox, MailError
 
 mcp = MCPServer(
     "Yandex Mail",
@@ -24,21 +24,21 @@ mcp = MCPServer(
     ),
 )
 
-LOG = logging.getLogger(__name__)
-
-
 def tool_errors(fn):
     @wraps(fn)
     def wrapped(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
         except LoginError as exc:
-            raise ToolError("IMAP authentication failed; check your credentials") from exc
-        except (PermissionError, LookupError, ValueError, RuntimeError) as exc:
+            raise ToolError("IMAP authentication failed; check your credentials and whether IMAP is enabled") from exc
+        except imaplib.IMAP4.abort as exc:
+            raise ToolError("IMAP connection was interrupted; please retry") from exc
+        except imaplib.IMAP4.error as exc:
+            raise ToolError(f"IMAP request failed: {exc}") from exc
+        except TimeoutError as exc:
+            raise ToolError("IMAP connection timed out; please retry") from exc
+        except (MailError, ConfigurationError) as exc:
             raise ToolError(str(exc)) from exc
-        except Exception:
-            LOG.exception("Unexpected mail tool failure")
-            raise
     return wrapped
 
 
@@ -86,6 +86,7 @@ def move_to_promotions(uid: int, confirm: bool = False) -> dict:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     load_dotenv()
     transport = os.getenv("MCP_TRANSPORT", "stdio").strip()
     if transport == "stdio":

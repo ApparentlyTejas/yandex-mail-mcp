@@ -21,6 +21,13 @@ def test_settings_repr_does_not_expose_password():
 def test_invalid_port_identifies_variable(monkeypatch):
     monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
     monkeypatch.setenv("YANDEX_APP_PASSWORD", "SUPERSECRET")
-    monkeypatch.setenv("YANDEX_IMAP_PORT", "")
+    monkeypatch.setenv("YANDEX_IMAP_PORT", "bad")
     with pytest.raises(ValueError, match="YANDEX_IMAP_PORT"):
         Settings.from_env()
+
+
+def test_blank_port_uses_default(monkeypatch):
+    monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
+    monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+    monkeypatch.setenv("YANDEX_IMAP_PORT", "  ")
+    assert Settings.from_env().imap_port == 993

@@ -8,17 +8,21 @@ from dotenv import load_dotenv
 from pydantic import SecretStr
 
 
+class ConfigurationError(ValueError):
+    """An actionable configuration error."""
+
+
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     return default if value is None else value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def env_int(name: str, default: int) -> int:
-    value = os.getenv(name, str(default))
+    value = (os.getenv(name) or "").strip() or str(default)
     try:
         return int(value)
     except ValueError as exc:
-        raise ValueError(f"{name} must be an integer") from exc
+        raise ConfigurationError(f"{name} must be an integer") from exc
 
 
 @dataclass(frozen=True)
@@ -40,7 +44,7 @@ class Settings:
         email = os.getenv("YANDEX_EMAIL", "").strip()
         password = SecretStr(os.getenv("YANDEX_APP_PASSWORD", "").strip())
         if not email or not password.get_secret_value():
-            raise RuntimeError("Set YANDEX_EMAIL and YANDEX_APP_PASSWORD in the environment (see .env.example)")
+            raise ConfigurationError("Set YANDEX_EMAIL and YANDEX_APP_PASSWORD in the environment (see .env.example)")
         return cls(
             email=email,
             app_password=password,
