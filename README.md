@@ -56,7 +56,10 @@ The endpoint is `http://127.0.0.1:8000/mcp`. Set `MCP_AUTH_TOKEN` to require a b
 
 CI publishes `ghcr.io/lagrunge82/yandex-mail-mcp` for Linux amd64 and arm64 after
 the checks pass on `main` or a `v*` tag. The `main` image has the `latest` and
-commit-SHA tags; version tags also produce matching image tags. Package visibility
+commit-SHA tags; version tags also produce matching image tags. Each publication
+also gets a unique `build-<run_id>-<run_attempt>` tag. Registry tags can still be
+overwritten; for a strictly immutable deployment, use the `image@sha256:...` digest
+reference recorded in the workflow run summary. Package visibility
 is managed in GitHub Packages; access to a private image requires registry login.
 For example, after the first publication:
 
