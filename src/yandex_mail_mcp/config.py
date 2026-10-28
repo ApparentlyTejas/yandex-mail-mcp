@@ -1,10 +1,11 @@
-"""Configuration loaded from environment variables; secrets are never logged."""
+"""Configuration loaded from environment variables."""
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
+from pydantic import SecretStr
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -15,18 +16,22 @@ def env_bool(name: str, default: bool = False) -> bool:
 @dataclass(frozen=True)
 class Settings:
     email: str
-    app_password: str = field(repr=False)
+    app_password: SecretStr = field(repr=False)
     imap_host: str = "imap.yandex.com"
     imap_port: int = 993
     allow_write: bool = False
     promotions_folder: str = "AI-Promotions"
 
+    def __post_init__(self) -> None:
+        if isinstance(self.app_password, str):
+            object.__setattr__(self, "app_password", SecretStr(self.app_password))
+
     @classmethod
     def from_env(cls) -> "Settings":
         load_dotenv()
         email = os.getenv("YANDEX_EMAIL", "").strip()
-        password = os.getenv("YANDEX_APP_PASSWORD", "").strip()
-        if not email or not password:
+        password = SecretStr(os.getenv("YANDEX_APP_PASSWORD", "").strip())
+        if not email or not password.get_secret_value():
             raise RuntimeError("Set YANDEX_EMAIL and YANDEX_APP_PASSWORD in the environment (see .env.example)")
         return cls(
             email=email,
