@@ -13,6 +13,14 @@ def env_bool(name: str, default: bool = False) -> bool:
     return default if value is None else value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name, str(default))
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+
 @dataclass(frozen=True)
 class Settings:
     email: str
@@ -37,7 +45,7 @@ class Settings:
             email=email,
             app_password=password,
             imap_host=os.getenv("YANDEX_IMAP_HOST", "imap.yandex.com"),
-            imap_port=int(os.getenv("YANDEX_IMAP_PORT", "993")),
+            imap_port=env_int("YANDEX_IMAP_PORT", 993),
             allow_write=env_bool("YANDEX_ALLOW_WRITE"),
             promotions_folder=os.getenv("YANDEX_PROMOTIONS_FOLDER", "AI-Promotions"),
         )

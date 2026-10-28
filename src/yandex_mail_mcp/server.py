@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import os
+import logging
+from functools import wraps
 
 from dotenv import load_dotenv
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from imapclient.exceptions import LoginError
 
 from .config import Settings
+from .config import env_int
 from .mail import Mailbox
 
 mcp = MCPServer(
@@ -19,36 +24,58 @@ mcp = MCPServer(
     ),
 )
 
+LOG = logging.getLogger(__name__)
+
+
+def tool_errors(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except LoginError as exc:
+            raise ToolError("IMAP authentication failed; check your credentials") from exc
+        except (PermissionError, LookupError, ValueError, RuntimeError) as exc:
+            raise ToolError(str(exc)) from exc
+        except Exception:
+            LOG.exception("Unexpected mail tool failure")
+            raise
+    return wrapped
+
 
 def _mailbox() -> Mailbox:
     return Mailbox(Settings.from_env())
 
 
 @mcp.tool()
+@tool_errors
 def list_folders() -> list[str]:
     """List IMAP folder names in the connected Yandex mailbox."""
     return _mailbox().folders()
 
 
 @mcp.tool()
+@tool_errors
 def list_recent_emails(limit: int = 20, unread_only: bool = False, folder: str = "INBOX") -> list[dict]:
     """Read most recent messages, without marking them read. Maximum 100."""
     return _mailbox().recent(limit=limit, unread_only=unread_only, folder=folder)
 
 
 @mcp.tool()
+@tool_errors
 def search_emails(query: str, limit: int = 20, folder: str = "INBOX") -> list[dict]:
     """Find sender, subject or content matches in the last 300 messages in a folder."""
     return _mailbox().search(query=query, limit=limit, folder=folder)
 
 
 @mcp.tool()
+@tool_errors
 def get_email(uid: int, folder: str = "INBOX") -> dict:
     """Read a message by IMAP UID, without marking it as read."""
     return _mailbox().message(uid=uid, folder=folder)
 
 
 @mcp.tool()
+@tool_errors
 def move_to_promotions(uid: int, confirm: bool = False) -> dict:
     """Move a message from Inbox to a dedicated promotions folder.
 
@@ -67,7 +94,7 @@ def main() -> None:
         mcp.run(
             transport="streamable-http",
             host=os.getenv("MCP_HOST", "127.0.0.1"),
-            port=int(os.getenv("MCP_PORT", "8000")),
+            port=env_int("MCP_PORT", 8000),
         )
     else:
         raise ValueError("MCP_TRANSPORT must be 'stdio' or 'streamable-http'")

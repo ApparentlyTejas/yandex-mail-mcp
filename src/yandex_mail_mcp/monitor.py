@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from imapclient import IMAPClient
 from openai import OpenAI
 
-from .config import Settings, env_bool
+from .config import Settings, env_bool, env_int
 from .mail import Mailbox
 
 LOG = logging.getLogger(__name__)
@@ -100,8 +100,11 @@ def notify_telegram(token: str, chat_id: str, message: dict, decision: dict) -> 
 
 def open_state(filename: str) -> sqlite3.Connection:
     path = Path(filename)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path)
+    except (OSError, sqlite3.OperationalError) as exc:
+        raise RuntimeError(f"Cannot open STATE_DB at {filename!r}; check its path and permissions") from exc
     conn.execute(
         """CREATE TABLE IF NOT EXISTS mailbox_progress (
              mailbox TEXT PRIMARY KEY, uidvalidity TEXT NOT NULL,
@@ -114,6 +117,13 @@ def open_state(filename: str) -> sqlite3.Connection:
              category TEXT NOT NULL, urgent INTEGER NOT NULL,
              confidence REAL NOT NULL, reason TEXT NOT NULL,
              processed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+             PRIMARY KEY (uidvalidity, uid)
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS processing_failures (
+             uidvalidity TEXT NOT NULL, uid INTEGER NOT NULL,
+             attempts INTEGER NOT NULL, stage TEXT NOT NULL,
              PRIMARY KEY (uidvalidity, uid)
            )"""
     )
@@ -167,29 +177,46 @@ def poll_once(
             # Deleted between SEARCH and FETCH: advance to avoid retry loops.
             save_progress(conn, "INBOX", validity, uid)
             continue
-        decision = classify(ai, model, message)
-        if decision["category"] == "IMPORTANT":
-            if token and chat_id:
-                notify_telegram(token, chat_id, message, decision)
+        stage = "classification"
+        try:
+            stored = conn.execute(
+                "SELECT category, urgent, confidence, reason FROM decisions WHERE uidvalidity=? AND uid=?",
+                (validity, uid),
+            ).fetchone()
+            if stored:
+                decision = dict(zip(("category", "urgent", "confidence", "reason"), stored))
             else:
-                LOG.warning("Important email detected (UID %d); Telegram is not configured", uid)
-        if (
-            auto_move and mailbox.config.allow_write
-            and decision["category"] == "PROMOTIONS"
-            and decision["confidence"] >= 0.98
-        ):
-            mailbox.move_to_promotions(uid, confirm=True)
-        conn.execute(
-            """INSERT OR REPLACE INTO decisions
-               (uidvalidity, uid, category, urgent, confidence, reason)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                validity, uid, decision["category"],
-                int(decision["urgent"]), decision["confidence"], decision["reason"],
-            ),
-        )
-        # Persist progress after successful classification and actions.
-        # An interrupted send can produce a duplicate Telegram alert on retry.
+                decision = classify(ai, model, message)
+                conn.execute(
+                    "INSERT INTO decisions (uidvalidity, uid, category, urgent, confidence, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                    (validity, uid, decision["category"], int(decision["urgent"]), decision["confidence"], decision["reason"]),
+                )
+                conn.commit()
+            stage = "notification"
+            if decision["category"] == "IMPORTANT":
+                if token and chat_id:
+                    notify_telegram(token, chat_id, message, decision)
+                else:
+                    LOG.warning("Important email detected (UID %d); Telegram is not configured", uid)
+            stage = "move"
+            if (auto_move and mailbox.config.allow_write and decision["category"] == "PROMOTIONS"
+                    and decision["confidence"] >= 0.98):
+                mailbox.move_to_promotions(uid, confirm=True)
+        except Exception:
+            conn.execute(
+                """INSERT INTO processing_failures (uidvalidity, uid, attempts, stage) VALUES (?, ?, 1, ?)
+                   ON CONFLICT(uidvalidity, uid) DO UPDATE SET attempts=attempts+1, stage=excluded.stage""",
+                (validity, uid, stage),
+            )
+            attempts = conn.execute("SELECT attempts FROM processing_failures WHERE uidvalidity=? AND uid=?", (validity, uid)).fetchone()[0]
+            conn.commit()
+            LOG.warning("UID %d failed at %s (attempt %d of 3)", uid, stage, attempts)
+            if attempts < 3:
+                break
+            LOG.error("Skipping UID %d after repeated failures at %s", uid, stage)
+            save_progress(conn, "INBOX", validity, uid)
+            continue
+        conn.execute("DELETE FROM processing_failures WHERE uidvalidity=? AND uid=?", (validity, uid))
         conn.commit()
         save_progress(conn, "INBOX", validity, uid)
         processed += 1
@@ -209,7 +236,7 @@ def main() -> None:
     auto_move = env_bool("AUTO_MOVE_PROMOTIONS")
     if auto_move and not config.allow_write:
         raise RuntimeError("AUTO_MOVE_PROMOTIONS requires YANDEX_ALLOW_WRITE=true")
-    interval = max(60, int(os.getenv("POLL_INTERVAL_SECONDS", "180")))
+    interval = max(60, env_int("POLL_INTERVAL_SECONDS", 180))
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     state = open_state(os.getenv("STATE_DB", "./data/mail_state.sqlite3"))
     mailbox = Mailbox(config)
