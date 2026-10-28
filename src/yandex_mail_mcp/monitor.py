@@ -218,7 +218,7 @@ def poll_once(
             )]
         pending = queued[:50]
         # Gather messages under a read-only connection.
-        messages = Mailbox._fetch(imap, pending, max_body_chars=2500)
+        messages = Mailbox._fetch(imap, pending, max_body_chars=2500, include_errors=True)
     fetched = {message["uid"]: message for message in messages}
     processed = 0
     for uid in pending:
@@ -231,8 +231,11 @@ def poll_once(
                 conn.execute("DELETE FROM pending_messages WHERE uidvalidity=? AND uid=?", (validity, uid))
                 conn.execute("DELETE FROM processing_failures WHERE uidvalidity=? AND uid=? AND attempts < 3", (validity, uid))
             continue
-        stage = "classification"
+        stage = "fetch"
         try:
+            if message.get("_fetch_error"):
+                raise ValueError("Incomplete IMAP response")
+            stage = "classification"
             stored = conn.execute(
                 "SELECT category, urgent, confidence, reason FROM decisions WHERE uidvalidity=? AND uid=?",
                 (validity, uid),
@@ -278,6 +281,14 @@ def poll_once(
     return processed
 
 
+def _stop_handler(stop_event: threading.Event):
+    def stop(signum, frame):
+        if stop_event.is_set():
+            raise KeyboardInterrupt
+        stop_event.set()
+    return stop
+
+
 def main() -> None:
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -295,11 +306,9 @@ def main() -> None:
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     state = open_state(os.getenv("STATE_DB", "./data/mail_state.sqlite3"))
     mailbox = Mailbox(config)
-    ai = OpenAI()
+    ai = OpenAI(timeout=30.0, max_retries=0)
     stop_event = threading.Event()
-    def stop(signum, frame):
-        stop_event.set()
-    previous_handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}
+    previous_handlers = {sig: signal.signal(sig, _stop_handler(stop_event)) for sig in (signal.SIGTERM, signal.SIGINT)}
     LOG.info("Inbox monitoring started; automatic moves: %s", auto_move)
     try:
         while not stop_event.is_set():

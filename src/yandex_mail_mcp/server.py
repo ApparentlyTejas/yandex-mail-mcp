@@ -135,7 +135,7 @@ async def move_to_promotions(uid: int, ctx: Context, confirm: bool = False) -> d
     mailbox = _mailbox()
     if not mailbox.config.allow_write:
         raise ToolError("Write operations are disabled. Set YANDEX_ALLOW_WRITE=true")
-    message = await anyio.to_thread.run_sync(lambda: mailbox.message(uid, folder="INBOX"))
+    message = await anyio.to_thread.run_sync(lambda: mailbox.headers(uid, folder="INBOX"))
     result = await ctx.elicit(
         f"Move message UID {uid} to promotions? Sender: {message['from'][:180]}\nSubject: {message['subject'][:200]}",
         schema=MoveConfirmation,
@@ -159,7 +159,11 @@ def main() -> None:
             if not env_bool("MCP_ALLOW_UNAUTHENTICATED_REMOTE"):
                 raise ConfigurationError("Non-loopback MCP_HOST requires MCP_AUTH_TOKEN or MCP_ALLOW_UNAUTHENTICATED_REMOTE=true")
             logging.warning("HTTP MCP is accessible without authentication on a non-loopback address")
-        hosts = [x.strip() for x in os.getenv("MCP_ALLOWED_HOSTS", "localhost:*,127.0.0.1:*,[::1]:*").split(",") if x.strip()]
+        default_hosts = "localhost:*,127.0.0.1:*,[::1]:*"
+        if host not in {"localhost", "127.0.0.1", "::1", "0.0.0.0", "::"}:
+            host_header = f"[{host}]" if ":" in host else host
+            default_hosts += f",{host_header}:*"
+        hosts = [x.strip() for x in os.getenv("MCP_ALLOWED_HOSTS", default_hosts).split(",") if x.strip()]
         origins = [x.strip() for x in os.getenv("MCP_ALLOWED_ORIGINS", "http://localhost:*,http://127.0.0.1:*,http://[::1]:*").split(",") if x.strip()]
         security = TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=hosts, allowed_origins=origins)
         app = mcp.streamable_http_app(host=host, transport_security=security)

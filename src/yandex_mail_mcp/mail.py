@@ -6,6 +6,10 @@ No delete, expunge, SMTP, or arbitrary folder mutation is exposed.
 from __future__ import annotations
 
 import re
+import base64
+import binascii
+import logging
+import quopri
 import imaplib
 from contextlib import contextmanager
 from email import policy
@@ -17,6 +21,8 @@ from typing import Iterator
 from imapclient import IMAPClient
 
 from .config import Settings
+
+LOG = logging.getLogger(__name__)
 
 
 class MailError(Exception):
@@ -162,46 +168,65 @@ class Mailbox:
             yield imap
 
     @staticmethod
-    def _fetch(imap: IMAPClient, uids: list[int], max_body_chars: int = 4000) -> list[dict]:
+    def _fetch(imap: IMAPClient, uids: list[int], max_body_chars: int = 4000, *, include_errors: bool = False) -> list[dict]:
         if not uids:
             return []
         fetched = imap.fetch(uids, ["BODY.PEEK[HEADER]", "BODYSTRUCTURE"])
-        result = []
+        summaries = {}
+        sections = {}
+
+        def failure(uid):
+            LOG.warning("Incomplete IMAP response for UID %s", uid)
+            if include_errors:
+                summaries[uid] = {"uid": uid, "_fetch_error": True}
+            else:
+                summaries.pop(uid, None)
+
         for uid in uids:
             if uid not in fetched:
-                continue
+                continue  # Message disappeared between SEARCH and FETCH.
             item = fetched[uid]
-            header = item.get(b"BODY[HEADER]")
-            structure = item.get(b"BODYSTRUCTURE")
+            header, structure = item.get(b"BODY[HEADER]"), item.get(b"BODYSTRUCTURE")
             if not isinstance(header, bytes) or not structure:
-                raise MailError(f"IMAP response for UID {uid} is missing header or MIME structure")
+                failure(uid)
+                continue
             summary = parse_message(header, uid, max_body_chars=max_body_chars)
-            parts, attachments = _text_sections(structure)
-            summary["has_attachments"] = attachments
+            parts, summary["has_attachments"] = _text_sections(structure)
+            summaries[uid] = summary
             if parts:
                 section, content_type, charset, encoding = parts[0]
-                response = imap.fetch([uid], [f"BODY.PEEK[{section}]<0.16384>"]).get(uid, {})
-                raw = response.get(f"BODY[{section}]<0>".encode())
-                if isinstance(raw, bytes):
-                    # Parse only the selected, bounded text section; never fetch
-                    # attachment sections to build a preview.
-                    from email.message import EmailMessage
-                    part = EmailMessage()
-                    part["Content-Type"] = f'{content_type}; charset="{charset}"'
-                    part["Content-Transfer-Encoding"] = encoding
-                    part.set_payload(raw.decode("ascii", errors="surrogateescape"))
-                    payload = part.get_payload(decode=True) or b""
+                sections.setdefault(section, []).append((uid, content_type, charset, encoding))
+
+        for section, entries in sections.items():
+            responses = imap.fetch([entry[0] for entry in entries], [f"BODY.PEEK[{section}]<0.16384>"])
+            for uid, content_type, charset, encoding in entries:
+                raw = responses.get(uid, {}).get(f"BODY[{section}]<0>".encode())
+                if not isinstance(raw, bytes):
+                    failure(uid)
+                    continue
+                try:
+                    if encoding.lower() == "base64":
+                        encoded = b"".join(raw.split())
+                        if len(encoded) % 4 == 1:
+                            encoded = encoded[:-1]
+                        encoded += b"=" * (-len(encoded) % 4)
+                        payload = base64.b64decode(encoded, validate=True)
+                    elif encoding.lower() == "quoted-printable":
+                        payload = quopri.decodestring(raw)
+                    else:
+                        payload = raw
                     try:
                         content = payload.decode(charset, errors="replace")
-                    except LookupError:
+                    except (LookupError, ValueError):
                         content = payload.decode("utf-8", errors="replace")
                     if content_type == "text/html":
                         parser = _TextFromHTML()
                         parser.feed(content)
                         content = " ".join(parser.fragments)
-                    summary["preview"] = re.sub(r"\s+", " ", content).strip()[:min(max_body_chars, 10000)]
-            result.append(summary)
-        return result
+                    summaries[uid]["preview"] = re.sub(r"\s+", " ", content).strip()[:min(max_body_chars, 10000)]
+                except (binascii.Error, ValueError):
+                    failure(uid)
+        return [summaries[uid] for uid in uids if uid in summaries]
 
     def folders(self) -> list[str]:
         with self.connect() as imap:
@@ -223,7 +248,9 @@ class Mailbox:
         with self.connect() as imap:
             imap.select_folder(folder, readonly=True)
             try:
-                uids = sorted(imap.search(["OR", "OR", "FROM", query, "SUBJECT", query, "TEXT", query], charset="UTF-8"))[::-1]
+                uids = sorted(imap.search(["TEXT", query], charset="UTF-8"))[::-1]
+            except imaplib.IMAP4.abort:
+                raise
             except imaplib.IMAP4.error:
                 uids = sorted(imap.search(["ALL"]))[-300:][::-1]
             else:
@@ -253,6 +280,16 @@ class Mailbox:
             if not isinstance(raw, bytes):
                 raise MailLookupError(f"Message UID {uid} not found in {folder}")
             return parse_message(raw, uid, max_body_chars=10000)
+
+    def headers(self, uid: int, folder: str = "INBOX") -> dict:
+        valid_uid(uid)
+        with self.connect() as imap:
+            imap.select_folder(folder, readonly=True)
+            item = imap.fetch([uid], ["BODY.PEEK[HEADER]"]).get(uid, {})
+            raw = item.get(b"BODY[HEADER]")
+            if not isinstance(raw, bytes):
+                raise MailLookupError(f"Message UID {uid} not found or header unavailable in {folder}")
+            return parse_message(raw, uid, max_body_chars=0)
 
     def move_to_promotions(self, uid: int, confirm: bool = False) -> dict:
         valid_uid(uid)

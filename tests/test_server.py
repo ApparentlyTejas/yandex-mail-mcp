@@ -55,6 +55,22 @@ def test_non_loopback_requires_auth_or_explicit_override(monkeypatch):
         server.main()
 
 
+def test_specific_host_is_allowed_by_default(monkeypatch):
+    monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
+    monkeypatch.setenv("MCP_HOST", "192.168.1.5")
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "secret")
+    monkeypatch.delenv("MCP_ALLOWED_HOSTS", raising=False)
+    monkeypatch.setattr(server, "load_dotenv", lambda: None)
+    captured = {}
+    def app(**kwargs):
+        captured.update(kwargs)
+        return object()
+    monkeypatch.setattr(server.mcp, "streamable_http_app", app)
+    monkeypatch.setattr(server.uvicorn, "run", lambda *args, **kwargs: None)
+    server.main()
+    assert "192.168.1.5:*" in captured["transport_security"].allowed_hosts
+
+
 def test_bearer_auth_rejects_missing_and_wrong_token():
     calls = []
     async def app(scope, receive, send):
@@ -76,7 +92,7 @@ def test_move_requires_client_acceptance(monkeypatch, action, approved, moved):
     calls = []
     class Box:
         config = SimpleNamespace(allow_write=True)
-        def message(self, uid, folder):
+        def headers(self, uid, folder):
             return {"from": "alice", "subject": "example"}
         def move_to_promotions(self, uid, confirm):
             calls.append(uid)

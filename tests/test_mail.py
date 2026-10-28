@@ -1,4 +1,6 @@
 from email.message import EmailMessage
+import base64
+import imaplib
 from contextlib import contextmanager
 
 import pytest
@@ -106,7 +108,7 @@ def test_search_uses_server_results_without_300_message_cap(monkeypatch):
     class IMAP:
         def select_folder(self, *args, **kwargs): pass
         def search(self, criteria, charset=None):
-            assert criteria == ["OR", "OR", "FROM", "счёт", "SUBJECT", "счёт", "TEXT", "счёт"]
+            assert criteria == ["TEXT", "счёт"]
             assert charset == "UTF-8"
             return [1, 500]
     @contextmanager
@@ -114,3 +116,51 @@ def test_search_uses_server_results_without_300_message_cap(monkeypatch):
     box.connect = connect
     monkeypatch.setattr(Mailbox, "_fetch", staticmethod(lambda imap, uids, **kwargs: [{"uid": uid} for uid in uids]))
     assert box.search("счёт", limit=1) == [{"uid": 500}]
+
+
+def test_fetch_batches_sections_and_handles_incomplete_base64_and_missing_structure():
+    data = base64.b64encode("Привет мир!".encode())[:-3]
+    assert len(data) % 4 == 1
+    calls = []
+    text_part = (b"TEXT", b"PLAIN", (b"CHARSET", b"UTF-8"), None, None, b"BASE64", 40, 1, None, None)
+    class IMAP:
+        def fetch(self, uids, fields):
+            calls.append((uids, fields))
+            if fields == ["BODY.PEEK[HEADER]", "BODYSTRUCTURE"]:
+                return {
+                    1: {b"BODY[HEADER]": b"Subject: one\r\n\r\n", b"BODYSTRUCTURE": text_part},
+                    2: {b"BODY[HEADER]": b"Subject: two\r\n\r\n", b"BODYSTRUCTURE": text_part},
+                    3: {b"BODY[HEADER]": b"Subject: bad\r\n\r\n"},
+                }
+            return {1: {b"BODY[1]<0>": data}, 2: {b"BODY[1]<0>": base64.b64encode(b"second")}}
+    result = Mailbox._fetch(IMAP(), [1, 2, 3], include_errors=True)
+    assert result[0]["preview"].startswith("Привет")
+    assert result[1]["preview"] == "second"
+    assert result[2] == {"uid": 3, "_fetch_error": True}
+    assert calls[1] == ([1, 2], ["BODY.PEEK[1]<0.16384>"])
+    assert [item["uid"] for item in Mailbox._fetch(IMAP(), [1, 2, 3])] == [1, 2]
+
+
+def test_search_does_not_fallback_on_aborted_connection():
+    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    class IMAP:
+        def select_folder(self, *args, **kwargs): pass
+        def search(self, *args, **kwargs): raise imaplib.IMAP4.abort("disconnected")
+    @contextmanager
+    def connect(): yield IMAP()
+    box.connect = connect
+    with pytest.raises(imaplib.IMAP4.abort, match="disconnected"):
+        box.search("example")
+
+
+def test_headers_does_not_fetch_full_message():
+    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    class IMAP:
+        def select_folder(self, *args, **kwargs): pass
+        def fetch(self, uids, fields):
+            assert fields == ["BODY.PEEK[HEADER]"]
+            return {1: {b"BODY[HEADER]": b"Subject: Large\r\nFrom: a@example.com\r\n\r\n"}}
+    @contextmanager
+    def connect(): yield IMAP()
+    box.connect = connect
+    assert box.headers(1)["subject"] == "Large"

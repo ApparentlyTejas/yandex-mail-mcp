@@ -9,7 +9,7 @@ A small, self-hosted **MCP server for Yandex Mail** with an optional AI-driven i
 MCP tools:
 - `list_folders`: list Yandex IMAP folders.
 - `list_recent_emails`: inspect recent messages (optionally unread only).
-- `search_emails`: search sender, subject, and preview in the 300 newest emails in a folder.
+- `search_emails`: search the folder on the server; if unsupported, search previews of the 300 newest emails.
 - `get_email`: inspect one message by IMAP UID.
 - `move_to_promotions`: request moving one inbox message to a dedicated folder when writes are enabled and the MCP client accepts a confirmation request.
 
@@ -52,7 +52,7 @@ The default transport is **stdio**, suitable for local MCP clients. For a local 
 MCP_TRANSPORT=streamable-http MCP_HOST=127.0.0.1 MCP_PORT=8000 yandex-mail-mcp
 ```
 
-The endpoint is `http://127.0.0.1:8000/mcp`. Set `MCP_AUTH_TOKEN` to require a bearer token. Non-loopback binds require a token, unless `MCP_ALLOW_UNAUTHENTICATED_REMOTE=true` is explicitly set. Configure `MCP_ALLOWED_HOSTS` and `MCP_ALLOWED_ORIGINS` for proxy hostnames; DNS rebinding protection is enabled. Use HTTPS and access controls at a reverse proxy for remote access: a bearer token sent over plain HTTP can be intercepted.
+The endpoint is `http://127.0.0.1:8000/mcp`. Set `MCP_AUTH_TOKEN` to require a bearer token. Non-loopback binds require a token, unless `MCP_ALLOW_UNAUTHENTICATED_REMOTE=true` is explicitly set. DNS rebinding protection is enabled. A specific `MCP_HOST` is allowed by default, but wildcard binds such as `0.0.0.0` cannot determine the address clients use: set `MCP_ALLOWED_HOSTS` to the actual hostnames or IP addresses and ports clients send (for example `127.0.0.1:*,192.168.1.5:*`), and configure `MCP_ALLOWED_ORIGINS` for browser origins when needed. Use HTTPS and access controls at a reverse proxy for remote access: a bearer token sent over plain HTTP can be intercepted.
 
 ## Run background monitoring with Docker
 
