@@ -1,0 +1,27 @@
+services:
+  monitor:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      STATE_DB: /data/mail_state.sqlite3
+    volumes:
+      - monitor_state:/data
+
+  # Optional local HTTP MCP endpoint. The host port is NOT exposed publicly.
+  # Run: docker compose --profile mcp up -d
+  mcp:
+    profiles: ["mcp"]
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+    ports:
+      - "127.0.0.1:8000:8000"
+    command: ["yandex-mail-mcp"]
+
+volumes:
+  monitor_state:
