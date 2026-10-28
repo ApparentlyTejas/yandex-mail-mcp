@@ -102,7 +102,7 @@ class Mailbox:
             ssl=True,
             timeout=30,
         ) as imap:
-            imap.login(self.config.email, self.config.app_password)
+            imap.login(self.config.email, self.config.app_password.get_secret_value())
             yield imap
 
     @staticmethod
