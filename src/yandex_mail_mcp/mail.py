@@ -16,8 +16,7 @@ from contextlib import contextmanager
 from email import policy
 from email.parser import BytesParser
 from html.parser import HTMLParser
-from typing import Iterator
-from typing_extensions import NotRequired, TypedDict
+from typing import Iterator, NotRequired, TypedDict
 
 from imapclient import IMAPClient
 
